@@ -209,3 +209,41 @@ jobs:
           name: gpui-example-debug.apk
           path: example/android/gradle/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # HarmonyOS / OpenHarmony cross-compilation (type-check only — no SDK needed)
+  #
+  # The OHOS target is Tier 3, so std is built from source with nightly. We only
+  # check (no linking), which works without the OpenHarmony SDK: the `.cargo`
+  # config points `cc-rs` at the host clang for the `psm` AArch64 stubs.
+  # ─────────────────────────────────────────────────────────────────────────────
+  ohos:
+    name: HarmonyOS Check (aarch64-unknown-linux-ohos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install nightly Rust + rust-src
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install clang (cross-assembler for psm)
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Cache Cargo registry + git deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ohos-cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: ohos-cargo-
+
+      - name: cargo check — gpui-mobile (OHOS)
+        run: cargo +nightly check --target aarch64-unknown-linux-ohos -Z build-std=std,panic_abort --lib
+
+      - name: cargo check — example app (OHOS)
+        working-directory: example
+        run: cargo +nightly check --target aarch64-unknown-linux-ohos -Z build-std=std,panic_abort --lib

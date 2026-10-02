@@ -130,7 +130,11 @@ pub fn set_system_chrome(style: &SystemChromeStyle) {
     {
         android::jni::set_system_chrome(style);
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[cfg(target_env = "ohos")]
+    {
+        ohos::apply_system_chrome(style);
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
     {
         let _ = style;
     }
@@ -238,7 +242,11 @@ pub fn show_keyboard_with_type(keyboard_type: KeyboardType) {
     {
         android::jni::show_keyboard_android(keyboard_type);
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[cfg(target_env = "ohos")]
+    {
+        ohos::show_keyboard(keyboard_type);
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
     {
         let _ = keyboard_type;
     }
@@ -265,7 +273,11 @@ pub fn hide_keyboard() {
     {
         android::jni::hide_keyboard_android();
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[cfg(target_env = "ohos")]
+    {
+        ohos::hide_keyboard();
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
     {}
 }
 
@@ -315,9 +327,14 @@ pub fn safe_area_insets() -> (f32, f32, f32, f32) {
             }
         }
     }
-    #[cfg(not(target_os = "ios"))]
-    {}
-    (0.0, 0.0, 0.0, 0.0)
+    #[cfg(target_env = "ohos")]
+    {
+        return ohos::safe_area_insets();
+    }
+    #[cfg(not(any(target_os = "ios", target_env = "ohos")))]
+    {
+        (0.0, 0.0, 0.0, 0.0)
+    }
 }
 
 // ── platform modules ─────────────────────────────────────────────────────────
@@ -328,6 +345,9 @@ pub mod ios;
 #[cfg(target_os = "android")]
 pub mod android;
 
+#[cfg(target_env = "ohos")]
+pub mod ohos;
+
 // ── public re-exports ────────────────────────────────────────────────────────
 
 #[cfg(target_os = "ios")]
@@ -335,6 +355,9 @@ pub use ios::{current_platform, IosPlatform};
 
 #[cfg(target_os = "android")]
 pub use android::{current_platform, AndroidPlatform};
+
+#[cfg(target_env = "ohos")]
+pub use ohos::{current_platform, OhosPlatform};
 
 pub use target_platform::{target_platform, TargetPlatform, DEFAULT_PLATFORM};
 
@@ -347,10 +370,10 @@ pub use target_platform::{target_platform, TargetPlatform, DEFAULT_PLATFORM};
 ///
 /// When compiled for iOS, returns an `Rc<dyn gpui::Platform>` backed by `IosPlatform`.
 /// When compiled for Android, returns an `Rc<dyn gpui::Platform>` backed by `AndroidPlatform`.
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
 pub fn current_platform(_headless: bool) -> ! {
     panic!(
         "gpui-mobile: `current_platform` is only available when compiled for \
-         `target_os = \"ios\"` or `target_os = \"android\"`."
+         `target_os = \"ios\"`, `target_os = \"android\"`, or `target_env = \"ohos\"`."
     );
 }

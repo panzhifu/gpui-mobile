@@ -1,0 +1,11 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "gpui_mobile_example",
+  "version": "1.0.0",
+  "description": "GPUI mobile example for HarmonyOS",
+  "main": "",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {},
+  "devDependencies": {}
+}

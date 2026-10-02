@@ -1,0 +1,17 @@
+# DevEco Studio / hvigor build output
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# Native libraries are produced by cargo (see build.sh ohos) and are ignored
+# by the repository-wide `*.so` rule.
+entry/libs/**/*.so
