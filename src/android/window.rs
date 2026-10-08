@@ -1415,6 +1415,11 @@ impl PlatformWindow for AndroidPlatformWindow {
             cb(RequestFrameOptions {
                 require_presentation: false,
                 force_render: text_dirty || surface_new,
+                // gpui-pre 0.3.8 加的帧溯源两个字段。这里是 AChoreographer 回调驱动的，
+                // 所以是 NativeCallback；时间戳按内建后端的规矩只在 `profiler` 下才采，
+                // 这里没有采，就报 None 而不是伪造一个。
+                signal_at: None,
+                signal_source: gpui::FrameRequestSource::NativeCallback,
             });
         });
     }
