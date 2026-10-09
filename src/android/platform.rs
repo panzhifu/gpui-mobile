@@ -198,6 +198,12 @@ pub struct AndroidPlatform {
     state: Mutex<AndroidPlatformState>,
     /// Set to `true` when `quit()` is called; the main loop checks this.
     should_quit: AtomicBool,
+    /// `quit()` was requested but GPUI's quit callback deferred it (it returns
+    /// `false` while its `App` is borrowed). The callback is retried every loop
+    /// iteration in `should_quit()` until it returns `true`, otherwise a quit
+    /// requested from inside an action handler would never complete — the app
+    /// would keep running (observed on device: three `quit()` calls, no exit).
+    quit_pending: AtomicBool,
 }
 
 /// Check whether a TrueType/OpenType font file contains CBDT (Color Bitmap
@@ -419,6 +425,7 @@ impl AndroidPlatform {
                 preferred_backend: AndroidBackend::Vulkan,
             }),
             should_quit: AtomicBool::new(false),
+            quit_pending: AtomicBool::new(false),
         }
     }
 
@@ -517,22 +524,45 @@ impl AndroidPlatform {
     ///
     /// Sets the `should_quit` flag; the main loop will exit on the next tick.
     /// Invokes the registered quit callback before returning.
+    ///
+    /// GPUI's callback returns `false` while its `App` is borrowed (which is the
+    /// case when `quit()` is called from inside an action handler, e.g. a back
+    /// gesture). We cannot wait for GPUI to call us again — it never does on this
+    /// backend — so the request is parked and retried in [`Self::should_quit`],
+    /// which the main loop checks every iteration.
     pub fn quit(&self) {
         log::info!("AndroidPlatform::quit");
-        // GPUI may defer shutdown while its App is borrowed. Take the callback
-        // out of the mutex so it can call back into the platform safely.
+        if self.try_quit_callback() {
+            self.should_quit.store(true, Ordering::SeqCst);
+            self.quit_pending.store(false, Ordering::SeqCst);
+        } else {
+            self.quit_pending.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Run the quit callback (if any) and report whether quitting is allowed now.
+    fn try_quit_callback(&self) -> bool {
+        // Take the callback out of the mutex so it can call back into the
+        // platform safely.
         let mut callback = self.state.lock().quit_callback.take();
         let can_quit = callback.as_mut().map_or(true, |callback| callback());
         if let Some(callback) = callback {
             self.state.lock().quit_callback.get_or_insert(callback);
         }
-        if can_quit {
-            self.should_quit.store(true, Ordering::SeqCst);
-        }
+        can_quit
     }
 
-    /// Returns `true` if `quit()` has been called.
+    /// Returns `true` if the app should exit. While a quit is pending (GPUI
+    /// deferred it), retries the callback so a deferred quit still completes.
     pub fn should_quit(&self) -> bool {
+        if !self.should_quit.load(Ordering::Relaxed)
+            && self.quit_pending.load(Ordering::Relaxed)
+            && self.try_quit_callback()
+        {
+            log::info!("AndroidPlatform::quit — deferred quit resolved");
+            self.should_quit.store(true, Ordering::SeqCst);
+            self.quit_pending.store(false, Ordering::SeqCst);
+        }
         self.should_quit.load(Ordering::Relaxed)
     }
 
