@@ -2,6 +2,8 @@ package dev.gpui.mobile;
 
 import android.app.NativeActivity;
 import android.content.pm.PackageManager;
+import android.graphics.Insets;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.Editable;
 import android.text.InputType;
@@ -9,12 +11,14 @@ import android.text.Selection;
 import android.text.TextWatcher;
 import android.view.KeyEvent;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputConnectionWrapper;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
+import android.window.OnBackInvokedDispatcher;
 
 /** NativeActivity with a UI-thread InputConnection for multistage IMEs. */
 public class GpuiInputActivity extends NativeActivity {
@@ -30,6 +34,61 @@ public class GpuiInputActivity extends NativeActivity {
             throw new IllegalStateException(error);
         }
         super.onCreate(state);
+
+        installWindowInsetsListener();
+        registerBackCallback();
+    }
+
+    /**
+     * Report window insets to the native side.
+     *
+     * The safe area is computed from the system-bar / gesture / cutout types
+     * ONLY — never {@code WindowInsets.Type.ime()}. SDL and Godot do the same:
+     * folding the keyboard into the safe area makes the whole layout jump when
+     * the IME opens. The keyboard is reported separately (visibility + height)
+     * so the native side can move a focused field without reflowing the rest.
+     */
+    @SuppressWarnings("deprecation") // getSystemWindowInset* on API 26-29
+    private void installWindowInsetsListener() {
+        getWindow().getDecorView().setOnApplyWindowInsetsListener((v, insets) -> {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                int mask = WindowInsets.Type.systemBars()
+                        | WindowInsets.Type.systemGestures()
+                        | WindowInsets.Type.mandatorySystemGestures()
+                        | WindowInsets.Type.tappableElement()
+                        | WindowInsets.Type.displayCutout();
+                Insets system = insets.getInsets(mask);
+                Insets ime = insets.getInsets(WindowInsets.Type.ime());
+                nativeWindowInsets(system.left, system.top, system.right, system.bottom,
+                        insets.isVisible(WindowInsets.Type.ime()) ? 1 : 0, ime.bottom);
+            } else {
+                nativeWindowInsets(
+                        insets.getSystemWindowInsetLeft(),
+                        insets.getSystemWindowInsetTop(),
+                        insets.getSystemWindowInsetRight(),
+                        insets.getSystemWindowInsetBottom(),
+                        0, 0);
+            }
+            // Do NOT consume: NativeActivity still needs the insets downstream.
+            return insets;
+        });
+    }
+
+    /**
+     * Route the system back gesture to the app.
+     *
+     * From Android 13 (API 33) the system delivers back through
+     * {@link OnBackInvokedDispatcher} instead of a KEYCODE_BACK key event, so
+     * without a registered callback an edge swipe does nothing. The native side
+     * turns this into the same synthetic BACK key the input queue produces.
+     *
+     * Requires {@code android:enableOnBackInvokedCallback="true"} in the manifest.
+     */
+    private void registerBackCallback() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, () -> nativeBackGesture());
+        }
     }
 
     public void gpuiShowKeyboard(int keyboardType, long session) {
@@ -226,4 +285,11 @@ public class GpuiInputActivity extends NativeActivity {
     }
 
     private static native void nativeIme(long session, int kind, String text, int start, int end);
+
+    /** System-bar insets (IME excluded) plus keyboard visibility/height, physical px. */
+    private static native void nativeWindowInsets(int left, int top, int right, int bottom,
+            int imeVisible, int imeBottom);
+
+    /** A back gesture / back button arrived; the native side turns it into BACK. */
+    private static native void nativeBackGesture();
 }

@@ -219,7 +219,7 @@ pub enum WindowAppearance {
 /// These represent the areas of the screen occupied by system UI elements
 /// (status bar, navigation bar, camera notch, etc.) that the app content
 /// should avoid drawing into — or at least pad/account for.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SafeAreaInsets {
     /// Top inset in device pixels (status bar / camera notch).
     pub top: f32,
@@ -261,12 +261,30 @@ struct WindowState {
     height: i32,
     scale_factor: f32,
 
-    /// Safe area insets in physical (device) pixels.
+    /// Safe area insets in physical (device) pixels, derived purely from
+    /// `AndroidApp::content_rect()`.
     ///
-    /// Updated from `AndroidApp::content_rect()` during `InitWindow` and
-    /// `WindowResized`.  The top inset accounts for the status bar / notch,
-    /// and the bottom inset accounts for the navigation bar / gesture area.
-    safe_area_insets: SafeAreaInsets,
+    /// This is a *fallback*: `content_rect()` folds the software keyboard into
+    /// the window's visible area, so it jumps by the IME height whenever the
+    /// keyboard opens. Whoever reports the system-bar insets explicitly (see
+    /// [`WindowState::system_bar_insets`]) wins over this value.
+    content_rect_insets: SafeAreaInsets,
+
+    /// Safe area insets in physical (device) pixels, reported by the Android
+    /// host through `nativeWindowInsets`, with the IME **excluded**.
+    ///
+    /// `safe_area_insets()` prefers this over [`WindowState::content_rect_insets`]
+    /// so that showing or hiding the keyboard never moves the app's chrome.
+    /// `None` until the host reports them for the first time.
+    system_bar_insets: Option<SafeAreaInsets>,
+
+    /// Software-keyboard (IME) insets in physical pixels, reported by the
+    /// Android host. Kept apart from the safe area so apps can scroll a focused
+    /// field into view without reflowing the rest of the layout.
+    ime_insets: SafeAreaInsets,
+
+    /// Whether the software keyboard is currently visible.
+    ime_visible: bool,
 
     /// Current appearance.
     appearance: WindowAppearance,
@@ -390,7 +408,10 @@ impl AndroidWindow {
             width,
             height,
             scale_factor,
-            safe_area_insets: SafeAreaInsets::default(),
+            content_rect_insets: SafeAreaInsets::default(),
+            system_bar_insets: None,
+            ime_insets: SafeAreaInsets::default(),
+            ime_visible: false,
             appearance: WindowAppearance::Light,
             is_active: true,
             transparent,
@@ -424,7 +445,10 @@ impl AndroidWindow {
             width,
             height,
             scale_factor,
-            safe_area_insets: SafeAreaInsets::default(),
+            content_rect_insets: SafeAreaInsets::default(),
+            system_bar_insets: None,
+            ime_insets: SafeAreaInsets::default(),
+            ime_visible: false,
             appearance: WindowAppearance::Light,
             is_active: false,
             transparent: false,
@@ -974,14 +998,43 @@ impl AndroidWindow {
     }
 
     /// Returns the current safe area insets in physical (device) pixels.
+    ///
+    /// Prefers the system-bar insets the host reported via
+    /// [`Self::update_system_insets`] (IME excluded) and falls back to the
+    /// content-rect value until those arrive.
     pub fn safe_area_insets(&self) -> SafeAreaInsets {
-        self.state.lock().safe_area_insets
+        let state = self.state.lock();
+        state.system_bar_insets.unwrap_or(state.content_rect_insets)
     }
 
     /// Returns the current safe area insets in logical pixels.
     pub fn safe_area_insets_logical(&self) -> SafeAreaInsets {
         let state = self.state.lock();
-        state.safe_area_insets.to_logical(state.scale_factor)
+        state
+            .system_bar_insets
+            .unwrap_or(state.content_rect_insets)
+            .to_logical(state.scale_factor)
+    }
+
+    /// Returns the current software-keyboard (IME) insets in physical pixels.
+    ///
+    /// These are reported separately from the safe area precisely so apps can
+    /// shift a focused field off the keyboard without reflowing the whole
+    /// layout. `bottom` is the keyboard height while it is visible, `0`
+    /// otherwise.
+    pub fn ime_insets(&self) -> SafeAreaInsets {
+        self.state.lock().ime_insets
+    }
+
+    /// Returns the current IME insets in logical pixels.
+    pub fn ime_insets_logical(&self) -> SafeAreaInsets {
+        let state = self.state.lock();
+        state.ime_insets.to_logical(state.scale_factor)
+    }
+
+    /// Whether the software keyboard is currently visible.
+    pub fn keyboard_visible(&self) -> bool {
+        self.state.lock().ime_visible
     }
 
     /// Update the safe area insets from the content rect provided by the system.
@@ -989,6 +1042,11 @@ impl AndroidWindow {
     /// `content_rect` is `(left, top, right, bottom)` in physical pixels — the
     /// area of the window NOT covered by system bars.  We compute insets by
     /// subtracting from the full window dimensions.
+    ///
+    /// **This folds the software keyboard into the bottom inset** (the system
+    /// documents `ContentRectChanged` as firing "such as from the soft input
+    /// window being shown or hidden"), so the result is only a fallback used
+    /// when the host never reports explicit system-bar insets.
     pub fn update_safe_area_from_content_rect(
         &self,
         content_left: i32,
@@ -1004,13 +1062,69 @@ impl AndroidWindow {
             right: (state.width - content_right).max(0) as f32,
         };
         log::info!(
-            "safe_area_insets updated: top={:.0} bottom={:.0} left={:.0} right={:.0} (physical px)",
+            "content_rect_insets updated: top={:.0} bottom={:.0} left={:.0} right={:.0} (physical px)",
             insets.top,
             insets.bottom,
             insets.left,
             insets.right,
         );
-        state.safe_area_insets = insets;
+        state.content_rect_insets = insets;
+    }
+
+    /// Update the system-bar safe area and the software-keyboard insets.
+    ///
+    /// Called by the Android host from a `View.OnApplyWindowInsetsListener`.
+    /// `system_*` must be computed from the system-bar / gesture / cutout inset
+    /// types only — **never** `WindowInsets.Type.ime()`. `ime_bottom` is the
+    /// keyboard height in physical pixels and `ime_visible` its visibility, kept
+    /// apart so the keyboard can be shown and hidden without moving the chrome.
+    ///
+    /// Runnable from any thread; the host calls it on the UI thread.
+    pub fn update_system_insets(
+        &self,
+        system_left: i32,
+        system_top: i32,
+        system_right: i32,
+        system_bottom: i32,
+        ime_visible: bool,
+        ime_bottom: i32,
+    ) {
+        let mut state = self.state.lock();
+        let system = SafeAreaInsets {
+            top: system_top.max(0) as f32,
+            bottom: system_bottom.max(0) as f32,
+            left: system_left.max(0) as f32,
+            right: system_right.max(0) as f32,
+        };
+        let ime = SafeAreaInsets {
+            top: 0.0,
+            bottom: ime_bottom.max(0) as f32,
+            left: 0.0,
+            right: 0.0,
+        };
+        let changed = state.ime_visible != ime_visible
+            || state.ime_insets.bottom != ime.bottom
+            || state.system_bar_insets != Some(system);
+        if changed {
+            log::info!(
+                "system insets updated: top={:.0} bottom={:.0} left={:.0} right={:.0} ime_visible={} ime_bottom={:.0} (physical px)",
+                system.top,
+                system.bottom,
+                system.left,
+                system.right,
+                ime_visible,
+                ime.bottom,
+            );
+        }
+        state.system_bar_insets = Some(system);
+        state.ime_insets = ime;
+        state.ime_visible = ime_visible;
+        drop(state);
+        if changed {
+            // Hand the app a chance to repaint (e.g. to move a field off the
+            // keyboard); the safe area it reads does not change here.
+            super::frame_source::schedule_frame();
+        }
     }
 
     // ── state queries ─────────────────────────────────────────────────────────

@@ -43,6 +43,25 @@ native `InputConnection`. Include `GpuiInputActivity.java` and retain the usual
 example manifest. The picker imports documents into app cache before returning
 filesystem paths; it does not require broad storage permissions.
 
+`GpuiInputActivity` also wires two things an app usually wants:
+
+- **Window insets.** It installs an `OnApplyWindowInsetsListener` and reports
+  the *system-bar* insets (with the IME excluded) plus the keyboard visibility
+  and height through `nativeWindowInsets`. `AndroidWindow::safe_area_insets_logical()`
+  therefore stays put when the software keyboard opens; the keyboard is exposed
+  separately via `AndroidWindow::ime_insets_logical()` / `keyboard_visible()`.
+  Keep `android:windowSoftInputMode="adjustNothing"` in the manifest so the
+  keyboard overlays the window instead of resizing it.
+- **The back gesture.** From Android 13 the system routes back through
+  `OnBackInvokedDispatcher` rather than delivering `AKEYCODE_BACK`, so an edge
+  swipe does nothing unless a callback is registered. `GpuiInputActivity`
+  registers one and forwards it to the native side, which dispatches the same
+  synthetic `AKEYCODE_BACK` the input queue produces (mapped to `escape`). Add
+  `android:enableOnBackInvokedCallback="true"` to `<application>`. **Apps are
+  responsible for handling back** — bind `escape` to your navigation and quit at
+  the root, or the app will not exit from a back gesture.
+
+
 ## Quick Start
 
 ### Prerequisites

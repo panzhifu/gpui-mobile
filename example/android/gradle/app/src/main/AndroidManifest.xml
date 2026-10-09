@@ -85,6 +85,7 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/GpuiTheme"
+        android:enableOnBackInvokedCallback="true"
     >
 
         <!--
@@ -96,6 +97,12 @@
           ANativeActivity_onCreate(), which is defined in gpui_mobile::android::jni.
           The spawned Rust thread calls gpui_android_main() (defined in the
           android_app example) to start the application.
+
+          `adjustNothing` (not `adjustResize`): the soft keyboard must overlay
+          the window, not shrink it. GpuiInputActivity reports the system-bar
+          insets and the IME separately, so the layout never reflows when the
+          keyboard opens. With `adjustResize` the window resizes on every frame
+          of the keyboard animation and pushes the bottom bar up.
         -->
         <activity
             android:name="dev.gpui.mobile.GpuiActivity"
@@ -104,7 +111,7 @@
             android:launchMode="singleTask"
             android:screenOrientation="unspecified"
             android:theme="@style/GpuiSplashTheme"
-            android:windowSoftInputMode="adjustResize"
+            android:windowSoftInputMode="adjustNothing"
         >
 
             <!-- The native library name WITHOUT the "lib" prefix and ".so" suffix.

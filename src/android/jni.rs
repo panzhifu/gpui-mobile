@@ -87,6 +87,20 @@ static INIT_WINDOW_PENDING: AtomicBool = AtomicBool::new(false);
 static WINDOW_RESIZED_PENDING: AtomicBool = AtomicBool::new(false);
 static CONFIG_CHANGED_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// A `ContentRectChanged` / `InsetsChanged` event is queued.
+///
+/// These only refresh the *fallback* safe area and must never be treated as a
+/// window resize: the system reports them for the soft keyboard too, and
+/// resizing on those is what makes the whole layout jump when the IME opens.
+static CONTENT_RECT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// A back gesture / back button was received from the Android side.
+///
+/// The `OnBackInvokedCallback` (API 33+) runs on the UI thread and must not
+/// touch GPUI directly, so it sets this flag and the event loop turns it into a
+/// synthetic `AKEYCODE_BACK` (→ `escape`) on GPUI's own thread.
+static BACK_PENDING: AtomicBool = AtomicBool::new(false);
+
 use android_activity::{AndroidApp, MainEvent, PollEvent};
 
 use super::platform::{AndroidPlatform, SharedPlatform};
@@ -787,6 +801,19 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
         }
 
+        // 4b. ContentRectChanged / InsetsChanged — refresh the fallback safe
+        // area, but do NOT resize the window. The host-reported system-bar
+        // insets (nativeWindowInsets) take precedence over this value.
+        if CONTENT_RECT_PENDING.swap(false, Ordering::Relaxed) {
+            log::debug!("deferred: ContentRectChanged");
+            if let Some(platform) = PLATFORM.get() {
+                if let Some(win) = platform.primary_window() {
+                    let cr = app.content_rect();
+                    win.update_safe_area_from_content_rect(cr.left, cr.top, cr.right, cr.bottom);
+                }
+            }
+        }
+
         // 5. Pause / background
         if PAUSE_PENDING.swap(false, Ordering::Relaxed) {
             log::info!("deferred: Pause (iter={})", iteration);
@@ -831,6 +858,18 @@ pub fn run_event_loop(app: &AndroidApp) {
 
         // Process input events.
         process_input_events(app);
+
+        // Apply the host's latest window insets now that a window exists.
+        apply_pending_insets();
+
+        // A back gesture / back button arrived from the Android side (API 33+
+        // `OnBackInvokedCallback`). Turn it into the same synthetic
+        // `AKEYCODE_BACK` key pair the input queue produces, so apps keep
+        // binding one thing (back → escape) for both paths.
+        if BACK_PENDING.swap(false, Ordering::Relaxed) {
+            log::info!("deferred: back gesture");
+            dispatch_synthetic_back_key();
+        }
 
         // Deferred initialisation callbacks (runs once).
         if !INIT_WINDOW_DONE.load(Ordering::Relaxed) {
@@ -935,6 +974,49 @@ fn dispose_all_platform_views() {
     });
 }
 
+/// Latest window insets the host reported before a window existed.
+///
+/// `OnApplyWindowInsets` can fire before `android_main` has opened the window;
+/// caching lets us apply the first real value as soon as one is available.
+static PENDING_INSETS: Mutex<Option<(i32, i32, i32, i32, bool, i32)>> = Mutex::new(None);
+
+/// Apply any cached insets once a window exists. No-op otherwise.
+fn apply_pending_insets() {
+    let Some(platform) = PLATFORM.get() else {
+        return;
+    };
+    let Some(win) = platform.primary_window() else {
+        return;
+    };
+    let insets = PENDING_INSETS.lock().unwrap().take();
+    if let Some((left, top, right, bottom, ime_visible, ime_bottom)) = insets {
+        win.update_system_insets(left, top, right, bottom, ime_visible, ime_bottom);
+    }
+}
+
+/// Dispatch a synthetic BACK key press to the primary window.
+///
+/// Reuses the input queue's mapping (`AKEYCODE_BACK` → `escape`) so a back
+/// gesture that came through Android's `OnBackInvokedDispatcher` behaves
+/// exactly like a hardware back button. Runs on GPUI's event-loop thread.
+fn dispatch_synthetic_back_key() {
+    use crate::android::keyboard::{AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP, AKEYCODE_BACK};
+    let Some(platform) = PLATFORM.get() else {
+        return;
+    };
+    let Some(win) = platform.primary_window() else {
+        return;
+    };
+    for action in [AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP] {
+        win.handle_key_event(crate::android::AndroidKeyEvent {
+            key_code: AKEYCODE_BACK,
+            action,
+            meta_state: 0,
+            unicode_char: 0,
+        });
+    }
+}
+
 /// Handle a single `MainEvent` from `android-activity`.
 fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
     match event {
@@ -1008,12 +1090,15 @@ fn handle_main_event(_app: &AndroidApp, event: MainEvent<'_>) {
 
         MainEvent::InsetsChanged { .. } => {
             log::debug!("MainEvent::InsetsChanged");
-            WINDOW_RESIZED_PENDING.store(true, Ordering::Relaxed);
+            // NOT a resize: the IME reports itself here too. Refresh the
+            // fallback safe area only, in the loop body.
+            CONTENT_RECT_PENDING.store(true, Ordering::Relaxed);
         }
 
         MainEvent::ContentRectChanged { .. } => {
             log::debug!("MainEvent::ContentRectChanged");
-            WINDOW_RESIZED_PENDING.store(true, Ordering::Relaxed);
+            // NOT a resize: fires when the soft keyboard opens/closes as well.
+            CONTENT_RECT_PENDING.store(true, Ordering::Relaxed);
         }
 
         _ => {
@@ -1403,7 +1488,56 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeIme(
     });
 }
 
-// ── tests ─────────────────────────────────────────────────────────────────────
+// ── window insets & back gesture ─────────────────────────────────────────────
+
+/// JNI bridge: the host's `View.OnApplyWindowInsetsListener` reported insets.
+///
+/// `system_*` are the system-bar / gesture / display-cutout insets in physical
+/// pixels with the software keyboard **excluded** (SDL and Godot compute their
+/// safe area the same way). `ime_visible` / `ime_bottom` describe the keyboard
+/// separately, so showing it never moves the app's chrome. Called on the UI
+/// thread; the value is cached and applied by the event loop.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeWindowInsets(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    system_left: i32,
+    system_top: i32,
+    system_right: i32,
+    system_bottom: i32,
+    ime_visible: i32,
+    ime_bottom: i32,
+) {
+    *PENDING_INSETS.lock().unwrap() = Some((
+        system_left,
+        system_top,
+        system_right,
+        system_bottom,
+        ime_visible != 0,
+        ime_bottom,
+    ));
+    apply_pending_insets();
+}
+
+/// JNI bridge: the user performed a back gesture / pressed the back button.
+///
+/// Registered by the host through `OnBackInvokedDispatcher` (API 33+), where
+/// the system no longer delivers `AKEYCODE_BACK` to the input queue. Flips a
+/// flag the event loop turns into a synthetic BACK key on GPUI's thread.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeBackGesture(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) {
+    BACK_PENDING.store(true, Ordering::Relaxed);
+    super::frame_source::schedule_frame();
+}
 
 // ── JNI export for GpuiActivity splash screen ────────────────────────────────
 
