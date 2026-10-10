@@ -1000,7 +1000,7 @@ fn apply_pending_insets() {
 /// gesture that came through Android's `OnBackInvokedDispatcher` behaves
 /// exactly like a hardware back button. Runs on GPUI's event-loop thread.
 fn dispatch_synthetic_back_key() {
-    use crate::android::keyboard::{AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP, AKEYCODE_BACK};
+    use crate::android::keyboard::{AKEYCODE_BACK, AKEY_EVENT_ACTION_DOWN, AKEY_EVENT_ACTION_UP};
     let Some(platform) = PLATFORM.get() else {
         return;
     };
