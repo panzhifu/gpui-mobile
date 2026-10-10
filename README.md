@@ -40,8 +40,12 @@ Custom Android hosts should extend `dev.gpui.mobile.GpuiInputActivity` instead o
 native `InputConnection`. Include `GpuiInputActivity.java` and retain the usual
 `android.app.lib_name` metadata. For GPUI file prompts, also package
 `GpuiPathPicker.java` and register its non-exported Activity as shown in the
-example manifest. The picker imports documents into app cache before returning
-filesystem paths; it does not require broad storage permissions.
+example manifest. File prompts import documents into app cache before returning
+filesystem paths. Folder prompts (`PathPromptOptions { directories: true, .. }`)
+use `ACTION_OPEN_DOCUMENT_TREE` and return the folder as a filesystem path when
+it lives on a local volume (internal storage or an SD card), falling back to the
+`content://` tree URI otherwise. Neither prompt requires broad storage
+permissions.
 
 `GpuiInputActivity` also wires two things an app usually wants:
 
