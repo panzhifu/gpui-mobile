@@ -1,5 +1,6 @@
 package dev.gpui.mobile;
 
+import android.Manifest;
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
@@ -7,6 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.location.LocationManager;
+import android.os.Environment;
 import android.net.Uri;
 import android.os.Build;
 import android.provider.Settings;
@@ -18,8 +20,11 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Permission handling helper for the GPUI permission_handler package.
  *
- * <p>Uses a transparent GpuiPickerActivity to handle the permission request
- * callback, since NativeActivity doesn't support onRequestPermissionsResult.</p>
+ * <p>Uses a transparent GpuiPermissionActivity to handle the permission request
+ * callback, since NativeActivity doesn't support onRequestPermissionsResult.
+ * The whole API is synchronous: the calling thread blocks on a latch until the
+ * result (or the user returning from a system settings page) arrives — so every
+ * entry point here must be called off the UI thread.</p>
  */
 public final class GpuiPermissions {
 
@@ -58,6 +63,17 @@ public final class GpuiPermissions {
             return STATUS_GRANTED;
         }
 
+        // Special-case: MANAGE_EXTERNAL_STORAGE ("All files access", API 30+).
+        // It is an AppOp-style special permission, not a runtime permission:
+        // check via isExternalStorageManager(), never via checkSelfPermission.
+        // Below API 30 the grant does not exist — legacy READ_EXTERNAL_STORAGE covers it.
+        if ("android.permission.MANAGE_EXTERNAL_STORAGE".equals(permission)) {
+            if (Build.VERSION.SDK_INT >= 30) {
+                return Environment.isExternalStorageManager() ? STATUS_GRANTED : STATUS_DENIED;
+            }
+            return checkPermission(activity, Manifest.permission.READ_EXTERNAL_STORAGE);
+        }
+
         int result = activity.checkSelfPermission(permission);
         return (result == PackageManager.PERMISSION_GRANTED) ? STATUS_GRANTED : STATUS_DENIED;
     }
@@ -86,6 +102,18 @@ public final class GpuiPermissions {
                 return Settings.canDrawOverlays(activity) ? STATUS_GRANTED : STATUS_DENIED;
             }
             return STATUS_GRANTED;
+        }
+
+        // Special-case: MANAGE_EXTERNAL_STORAGE — bring the user to the system
+        // settings page (Godot PermissionsUtil's approach) and block until they
+        // come back, then re-check. Must be called off the UI thread (see the
+        // class doc: the whole sync API latches).
+        if ("android.permission.MANAGE_EXTERNAL_STORAGE".equals(permission)) {
+            if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+                boolean granted = requestManageExternalStorageViaActivity(activity);
+                return granted ? STATUS_GRANTED : STATUS_DENIED;
+            }
+            return checkPermission(activity, permission);
         }
 
         return requestViaActivity(activity, new String[]{permission})[0];
@@ -175,6 +203,25 @@ public final class GpuiPermissions {
 
         if (allGranted) return results;
 
+        // MANAGE_EXTERNAL_STORAGE is not a runtime permission — feeding it to
+        // requestPermissions() is a silent no-op. Route it through the settings
+        // round-trip instead, then handle the rest as ordinary runtime requests.
+        java.util.List<String> manage = new java.util.ArrayList<>();
+        for (int i = 0; i < permissions.length; i++) {
+            if ("android.permission.MANAGE_EXTERNAL_STORAGE".equals(permissions[i])
+                    && results[i] == -1 && Build.VERSION.SDK_INT >= 30) {
+                manage.add(permissions[i]);
+            }
+        }
+        for (String permission : manage) {
+            boolean granted = requestManageExternalStorageViaActivity(activity);
+            for (int i = 0; i < permissions.length; i++) {
+                if (permissions[i].equals(permission)) {
+                    results[i] = granted ? STATUS_GRANTED : STATUS_DENIED;
+                }
+            }
+        }
+
         // Filter to only ungranted permissions
         java.util.List<String> needed = new java.util.ArrayList<>();
         java.util.List<Integer> neededIndices = new java.util.ArrayList<>();
@@ -223,6 +270,49 @@ public final class GpuiPermissions {
         }
 
         return results;
+    }
+
+    /**
+     * Bring the user to the system "All files access" settings page and block
+     * until they come back (via GpuiPermissionActivity's onActivityResult).
+     *
+     * <p>The calling thread latches — same contract as the runtime-permission
+     * path: call this off the UI thread or you will deadlock the main thread.</p>
+     *
+     * @return true if the user left the settings page with the grant on.
+     */
+    private static boolean requestManageExternalStorageViaActivity(Activity activity) {
+        if (Build.VERSION.SDK_INT < 30) {
+            return false;
+        }
+        if (Environment.isExternalStorageManager()) {
+            return true;
+        }
+
+        // Godot PermissionsUtil's two intents: the package-scoped one lands
+        // directly on our switch; the generic one is the fallback some skins need.
+        Intent intent;
+        try {
+            intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+            intent.setData(Uri.parse("package:" + activity.getPackageName()));
+        } catch (Exception ignored) {
+            intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+        CountDownLatch latch = new CountDownLatch(1);
+        GpuiPermissionActivity.sSettingsIntent = intent;
+        GpuiPermissionActivity.sSettingsLatch = latch;
+
+        activity.startActivity(new Intent(activity, GpuiPermissionActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        return Environment.isExternalStorageManager();
     }
 
     private GpuiPermissions() {}

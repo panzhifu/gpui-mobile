@@ -1,6 +1,7 @@
 package dev.gpui.mobile;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.os.Bundle;
 
 import java.util.concurrent.CountDownLatch;
@@ -19,7 +20,10 @@ import java.util.concurrent.atomic.AtomicIntegerArray;
 public class GpuiPermissionActivity extends Activity {
 
     private static final int PERMISSION_REQUEST_CODE = 9002;
+    /** Settings round-trip (e.g. MANAGE_EXTERNAL_STORAGE "All files access"). */
+    private static final int SETTINGS_REQUEST_CODE = 9003;
     private static final String KEY_WAITING = "gpui_waiting_for_permission";
+    private static final String KEY_WAITING_SETTINGS = "gpui_waiting_for_settings";
 
     /** Latch that the calling thread waits on. */
     static CountDownLatch sLatch;
@@ -28,8 +32,14 @@ public class GpuiPermissionActivity extends Activity {
     /** Grant results (PackageManager.PERMISSION_GRANTED or DENIED). */
     static AtomicIntegerArray sResults;
 
+    /** Settings round-trip: the intent to fire, and the latch to release on return. */
+    static Intent sSettingsIntent;
+    static CountDownLatch sSettingsLatch;
+
     /** Whether we are waiting for a permission result. */
     private boolean mWaitingForResult = false;
+    /** Whether we are waiting for the user to come back from a settings page. */
+    private boolean mWaitingForSettings = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -40,6 +50,14 @@ public class GpuiPermissionActivity extends Activity {
             // The system will re-deliver the result via onRequestPermissionsResult.
             android.util.Log.i("GpuiPermission", "Recreated after process death, waiting for result");
             mWaitingForResult = true;
+            return;
+        }
+
+        if (sSettingsIntent != null && sSettingsLatch != null) {
+            // Settings round-trip (e.g. "All files access"): fire the intent and
+            // release the latch in onActivityResult when the user comes back.
+            mWaitingForSettings = true;
+            startActivityForResult(sSettingsIntent, SETTINGS_REQUEST_CODE);
             return;
         }
 
@@ -56,6 +74,27 @@ public class GpuiPermissionActivity extends Activity {
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
         outState.putBoolean(KEY_WAITING, mWaitingForResult);
+        outState.putBoolean(KEY_WAITING_SETTINGS, mWaitingForSettings);
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == SETTINGS_REQUEST_CODE) {
+            // The caller re-checks the actual grant (isExternalStorageManager);
+            // our job is only to release the latch.
+            mWaitingForSettings = false;
+            releaseSettingsLatch();
+            finish();
+        }
+    }
+
+    private void releaseSettingsLatch() {
+        if (sSettingsLatch != null) {
+            sSettingsLatch.countDown();
+            sSettingsLatch = null;
+            sSettingsIntent = null;
+        }
     }
 
     @Override
@@ -76,6 +115,8 @@ public class GpuiPermissionActivity extends Activity {
     @Override
     public void onBackPressed() {
         mWaitingForResult = false;
+        mWaitingForSettings = false;
+        releaseSettingsLatch();
         deliverResult();
         super.onBackPressed();
     }
@@ -86,6 +127,12 @@ public class GpuiPermissionActivity extends Activity {
         } else {
             // Process death recovery — latch is gone. Just finish gracefully.
             android.util.Log.i("GpuiPermission", "No latch (process death recovery), finishing");
+        }
+        // If this instance was recreated for a settings round-trip that its
+        // process can no longer answer, release that latch too so the waiting
+        // thread does not hang forever.
+        if (isFinishing() && mWaitingForSettings) {
+            releaseSettingsLatch();
         }
     }
 }

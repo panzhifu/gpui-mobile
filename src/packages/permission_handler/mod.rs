@@ -44,6 +44,13 @@ pub enum Permission {
     Notification,
     /// Read external storage (Android only, pre-API 33).
     Storage,
+    /// Manage all files — Android 11+ "All files access" (`MANAGE_EXTERNAL_STORAGE`).
+    ///
+    /// 特殊权限：不走系统权限对话框，而是把读者带到系统设置页去开开关（参考
+    /// Godot `PermissionsUtil` 的做法）。检查走 `Environment.isExternalStorageManager()`；
+    /// API 30 以下没有这一档，检查与请求都退回 [`Permission::Storage`]。
+    /// 注意：`request_permission` 对它**阻塞到读者从设置页回来**，只能在后台线程上调用。
+    ManageExternalStorage,
     /// Speech recognition.
     Speech,
     /// App tracking transparency (iOS 14+).

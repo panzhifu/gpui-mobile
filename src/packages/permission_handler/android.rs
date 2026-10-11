@@ -20,6 +20,7 @@ fn permission_to_android_string(permission: Permission) -> &'static str {
         Permission::Bluetooth => "android.permission.BLUETOOTH_CONNECT",
         Permission::Notification => "android.permission.POST_NOTIFICATIONS",
         Permission::Storage => "android.permission.READ_EXTERNAL_STORAGE",
+        Permission::ManageExternalStorage => "android.permission.MANAGE_EXTERNAL_STORAGE",
         Permission::Speech => "android.permission.RECORD_AUDIO",
         Permission::AppTrackingTransparency => "", // iOS-only
         Permission::SystemAlertWindow => "android.permission.SYSTEM_ALERT_WINDOW",
