@@ -825,6 +825,9 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
             // Pause platform views
             pause_platform_views();
+            // Stop sensor sampling while backgrounded
+            #[cfg(feature = "sensors")]
+            pause_sensors();
         }
 
         // 6. Resume / foreground
@@ -838,6 +841,9 @@ pub fn run_event_loop(app: &AndroidApp) {
             }
             // Resume platform views
             resume_platform_views();
+            // Re-arm the sensors that were being read before the pause
+            #[cfg(feature = "sensors")]
+            resume_sensors();
         }
 
         // Track active/focused state.
@@ -965,6 +971,44 @@ fn dispose_all_platform_views() {
             let _ = env.call_static_method(
                 &helper_class,
                 jni::jni_str!("disposeAll"),
+                jni::jni_sig!("()V"),
+                &[],
+            );
+            env.exception_clear();
+        }
+        Ok(())
+    });
+}
+
+/// Stop sensor sampling when the app goes to background.
+///
+/// A `SensorManager` listener costs power whether or not anyone reads the
+/// values, and `GpuiSensors` remembers which sensors were started so
+/// [`resume_sensors`] can re-arm them.
+#[cfg(feature = "sensors")]
+pub(crate) fn pause_sensors() {
+    let _ = with_env(|env| {
+        if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiSensors") {
+            let _ = env.call_static_method(
+                &helper_class,
+                jni::jni_str!("pause"),
+                jni::jni_sig!("()V"),
+                &[],
+            );
+            env.exception_clear();
+        }
+        Ok(())
+    });
+}
+
+/// Re-arm the sensors [`pause_sensors`] stopped when the app returns to foreground.
+#[cfg(feature = "sensors")]
+pub(crate) fn resume_sensors() {
+    let _ = with_env(|env| {
+        if let Ok(helper_class) = find_app_class(env, "dev.gpui.mobile.GpuiSensors") {
+            let _ = env.call_static_method(
+                &helper_class,
+                jni::jni_str!("resume"),
                 jni::jni_sig!("()V"),
                 &[],
             );
@@ -1644,6 +1688,27 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiMediaSession_nativeMediaSeek(
 ) {
     log::info!("nativeMediaSeek: {}ms", position_ms);
     crate::packages::media_session::notify_seek(position_ms as u64);
+}
+
+/// JNI bridge: one sensor sample delivered by `GpuiSensors`.
+///
+/// `sensor` is the id `GpuiSensors.start()` was called with. Primitives only, by
+/// design: a sensor fires up to ~100 Hz, so this path must not allocate or look
+/// up objects.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[cfg(feature = "sensors")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiSensors_nativeSensorSample(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+    sensor: i32,
+    x: f32,
+    y: f32,
+    z: f32,
+) {
+    crate::packages::sensors::notify_sample(sensor, x, y, z);
 }
 
 #[cfg(test)]

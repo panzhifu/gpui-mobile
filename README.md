@@ -47,6 +47,15 @@ it lives on a local volume (internal storage or an SD card), falling back to the
 `content://` tree URI otherwise. Neither prompt requires broad storage
 permissions.
 
+`packages::sensors` needs `GpuiSensors.java` as well. Rust subscribes a sensor
+there the first time an app reads it, and the newest sample of each subscribed
+sensor is kept in native memory for `accelerometer()` / `gyroscope()` /
+`magnetometer()` / `barometer()` to read. Subscriptions are dropped while the app
+is in the background and re-armed on resume. Readings stay in the device's
+natural frame — they are not rotated to match the display orientation, which is
+also what iOS reports. Without that class `available_sensors()` still answers and
+every reading stays `None`.
+
 `GpuiInputActivity` also wires two things an app usually wants:
 
 - **Window insets.** It installs an `OnApplyWindowInsetsListener` and reports

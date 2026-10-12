@@ -232,12 +232,16 @@ fn render_thread(launch: Launch) {
                     if let Some(win) = platform.primary_window() {
                         win.set_active(true);
                     }
+                    #[cfg(feature = "sensors")]
+                    super::jni::resume_sensors();
                 }
                 Command::Paused => {
                     platform.did_enter_background();
                     if let Some(win) = platform.primary_window() {
                         win.set_active(false);
                     }
+                    #[cfg(feature = "sensors")]
+                    super::jni::pause_sensors();
                 }
                 Command::Touch(point) => match platform.primary_window() {
                     Some(win) => win.handle_touch(point),
