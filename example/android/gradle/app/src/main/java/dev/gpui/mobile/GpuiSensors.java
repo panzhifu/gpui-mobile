@@ -126,6 +126,27 @@ public class GpuiSensors {
     }
 
     /**
+     * Stop reporting one sensor and forget its request, so a later
+     * {@link #start} arms it again.
+     */
+    public static void stop(final int id) {
+        final SensorManager manager = sSensorManager;
+        if (manager == null || id < 0 || id >= ID_COUNT) {
+            return;
+        }
+        sMainHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                sRequested[id] = false;
+                Sensor sensor = manager.getDefaultSensor(typeForId(id));
+                if (sensor != null) {
+                    manager.unregisterListener(sListener, sensor);
+                }
+            }
+        });
+    }
+
+    /**
      * Stop sampling. Remembered requests survive, so {@link #resume()} re-arms
      * exactly what was being read.
      */

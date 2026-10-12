@@ -11,6 +11,12 @@
 //!     // accel.x / accel.y / accel.z in m/s², device frame, gravity included
 //! }
 //! ```
+//!
+//! Two ways to consume readings continuously: [`subscribe`] hands every sample
+//! to a callback on the platform's own thread, and [`set_live_updates`] keeps the
+//! polling getters live by asking for a redraw per sample. A screen that reads a
+//! sensor while painting needs one or the other -- without them a new reading
+//! only shows up when something else makes the window redraw.
 
 #[cfg(target_os = "android")]
 mod android;
@@ -131,15 +137,19 @@ pub fn barometer() -> Option<BarometerData> {
     }
 }
 
-// ── sample cache shared by the platform layers ───────────────────────────────
+// ── subscriptions and the shared sample cache ────────────────────────────────
 
-/// Which polled sensor a cached reading belongs to.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+/// Which sensor a polled reading or a subscription belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SensorKind {
+pub enum SensorKind {
+    /// m/s², gravity included.
     Accelerometer,
+    /// rad/s.
     Gyroscope,
+    /// µT.
     Magnetometer,
+    /// hPa, carried in [`SensorData::x`]; the other axes stay 0 because Android
+    /// reports a single value for pressure.
     Barometer,
 }
 
@@ -155,11 +165,104 @@ impl SensorKind {
     }
 }
 
+/// A callback that receives every sample of the sensor it subscribed to.
+pub type SensorCallback = Box<dyn Fn(SensorData) + Send + 'static>;
+
 /// Newest sample per sensor: written on whichever thread the platform delivers
 /// samples on, read by the polling getters.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 static LATEST: [parking_lot::Mutex<Option<SensorData>>; 4] =
     [const { parking_lot::Mutex::new(None) }; 4];
+
+/// One handler per sensor, `None` while nobody has subscribed.
+static HANDLERS: [parking_lot::Mutex<Option<SensorCallback>>; 4] =
+    [const { parking_lot::Mutex::new(None) }; 4];
+
+/// Deliver every sample of `kind` to `handler` until [`unsubscribe`] is called.
+///
+/// Subscribing also starts sampling, so a subscriber never has to poll. The
+/// handler runs on the thread Android delivers the sample on -- its main (UI)
+/// thread -- **not** on GPUI's render thread, so it must not touch window or
+/// entity state; hand the reading to an executor the app captured instead. It
+/// runs while this sensor's handler slot is locked, so it must not call
+/// [`subscribe`] or [`unsubscribe`].
+///
+/// One handler per sensor: subscribing again replaces the previous one.
+pub fn subscribe(
+    kind: SensorKind,
+    handler: impl Fn(SensorData) + Send + 'static,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        android::subscribe(kind, handler)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (kind, handler);
+        Err("sensors::subscribe is only implemented on Android".to_string())
+    }
+}
+
+/// Stop delivering samples of `kind` and stop sampling that sensor.
+///
+/// The polling getters keep whatever reading was last cached; a later read
+/// subscribes the sensor again.
+pub fn unsubscribe(kind: SensorKind) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        android::unsubscribe(kind)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = kind;
+        Err("sensors::unsubscribe is only implemented on Android".to_string())
+    }
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn set_handler(kind: SensorKind, handler: Option<SensorCallback>) {
+    *HANDLERS[kind.index()].lock() = handler;
+}
+
+/// Whether every arriving sample should ask for a redraw.
+static LIVE_UPDATES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Redraw as each new sample arrives so the polling getters stay live.
+///
+/// A screen that only reads [`accelerometer()`] and friends while painting
+/// otherwise sees a new reading when something else happens to make it redraw.
+/// Enabling this forces a frame per sample instead -- about 16 per second at the
+/// reporting rate this package asks sensors for -- so leave it on only while a
+/// screen really is following the sensor. Sensors nobody has read stay silent,
+/// and a [`subscribe`]d sensor delivers to its handler rather than forcing
+/// frames.
+pub fn set_live_updates(enabled: bool) {
+    LIVE_UPDATES.store(enabled, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn live_updates() -> bool {
+    LIVE_UPDATES.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Record `data` as the newest reading of `kind` and feed it to that sensor's
+/// handler, if it has one.
+///
+/// Returns whether a frame must be forced so a *polling* reader notices the
+/// reading: the sample that first fills an empty cache always does, and later
+/// samples only while [`set_live_updates`] is on. A subscriber is being called
+/// here already, so it needs no frame.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn dispatch_sample(kind: SensorKind, data: SensorData) -> bool {
+    let first = store_latest(kind, data);
+    match HANDLERS[kind.index()].lock().as_mut() {
+        Some(callback) => {
+            callback(data);
+            false
+        }
+        None => first || live_updates(),
+    }
+}
 
 /// Record `data` as the newest reading of `kind`.
 ///
@@ -197,37 +300,67 @@ pub(crate) fn notify_sample(kind: i32, x: f32, y: f32, z: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn reading(x: f64, y: f64, z: f64) -> SensorData {
+        SensorData { x, y, z }
+    }
+
+    // Each test owns one sensor: the cache is process-global, so sharing a kind
+    // across tests running in parallel threads would make them interfere.
 
     #[test]
-    fn first_sample_of_a_sensor_is_reported_as_new() {
-        let reading = SensorData {
-            x: 0.1,
-            y: 0.2,
-            z: 9.8,
-        };
-        assert!(store_latest(SensorKind::Accelerometer, reading));
-        assert!(!store_latest(SensorKind::Accelerometer, reading));
+    fn the_cache_holds_the_most_recent_sample_and_flags_the_first() {
+        assert!(latest(SensorKind::Accelerometer).is_none());
+        assert!(store_latest(
+            SensorKind::Accelerometer,
+            reading(0.1, 0.2, 9.8)
+        ));
+        assert!(!store_latest(
+            SensorKind::Accelerometer,
+            reading(0.1, 0.2, 9.9)
+        ));
+        assert_eq!(latest(SensorKind::Accelerometer).map(|d| d.z), Some(9.9));
     }
 
     #[test]
-    fn latest_returns_the_most_recent_sample() {
-        store_latest(
+    fn a_sample_reaches_the_handler_and_needs_no_forced_frame() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        set_handler(
             SensorKind::Gyroscope,
-            SensorData {
-                x: 1.0,
-                y: 0.0,
-                z: 0.0,
-            },
+            Some(Box::new(move |data| {
+                recorder.lock().unwrap().push(data);
+            })),
         );
-        store_latest(
+
+        assert!(!dispatch_sample(
             SensorKind::Gyroscope,
-            SensorData {
-                x: 2.5,
-                y: 0.0,
-                z: 0.0,
-            },
-        );
+            reading(1.5, 0.0, 0.0)
+        ));
+        assert!(!dispatch_sample(
+            SensorKind::Gyroscope,
+            reading(2.5, 0.0, 0.0)
+        ));
+
+        set_handler(SensorKind::Gyroscope, None);
+        let samples = seen.lock().unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[1].x, 2.5);
+        // Polling still sees what the subscriber was handed.
         assert_eq!(latest(SensorKind::Gyroscope).map(|d| d.x), Some(2.5));
+    }
+
+    #[test]
+    fn a_polling_reader_is_forced_to_a_frame_on_the_first_sample_and_while_live() {
+        let kind = SensorKind::Magnetometer;
+        assert!(dispatch_sample(kind, reading(12.0, 0.0, 0.0)));
+        assert!(!dispatch_sample(kind, reading(13.0, 0.0, 0.0)));
+
+        set_live_updates(true);
+        assert!(dispatch_sample(kind, reading(14.0, 0.0, 0.0)));
+        set_live_updates(false);
+        assert!(!dispatch_sample(kind, reading(15.0, 0.0, 0.0)));
     }
 
     #[test]

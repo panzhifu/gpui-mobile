@@ -50,11 +50,14 @@ permissions.
 `packages::sensors` needs `GpuiSensors.java` as well. Rust subscribes a sensor
 there the first time an app reads it, and the newest sample of each subscribed
 sensor is kept in native memory for `accelerometer()` / `gyroscope()` /
-`magnetometer()` / `barometer()` to read. Subscriptions are dropped while the app
-is in the background and re-armed on resume. Readings stay in the device's
-natural frame — they are not rotated to match the display orientation, which is
-also what iOS reports. Without that class `available_sensors()` still answers and
-every reading stays `None`.
+`magnetometer()` / `barometer()` to read. `subscribe()` instead delivers every
+sample to a callback on Android's main thread (not GPUI's render thread, so it
+cannot touch entity state), and `set_live_updates(true)` makes the polling
+getters live by asking for a redraw per sample. Subscriptions are dropped while
+the app is in the background and re-armed on resume. Readings stay in the
+device's natural frame — they are not rotated to match the display orientation,
+which is also what iOS reports. Without that class `available_sensors()` still
+answers and every reading stays `None`.
 
 `GpuiInputActivity` also wires two things an app usually wants:
 

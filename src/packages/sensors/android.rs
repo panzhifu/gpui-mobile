@@ -1,4 +1,6 @@
-use super::{latest, store_latest, BarometerData, SensorAvailability, SensorData, SensorKind};
+use super::{
+    dispatch_sample, latest, set_handler, BarometerData, SensorAvailability, SensorData, SensorKind,
+};
 use crate::android::jni as jni_helpers;
 use jni::objects::JValue;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,15 +13,16 @@ const TYPE_GYROSCOPE: i32 = 4;
 const TYPE_MAGNETIC_FIELD: i32 = 2;
 const TYPE_PRESSURE: i32 = 6;
 
-// Sensor ids `GpuiSensors.start()` takes; keep in sync with GpuiSensors.java.
+/// Sensor ids `GpuiSensors.start()` / `.stop()` take; keep in sync with
+/// `GpuiSensors.java`.
 const SENSOR_ACCELEROMETER: i32 = 0;
 const SENSOR_GYROSCOPE: i32 = 1;
 const SENSOR_MAGNETOMETER: i32 = 2;
 const SENSOR_BAROMETER: i32 = 3;
 
-/// Whether each sensor's Java listener has already been asked for, so a screen
-/// that reads a sensor every frame costs one JNI call per sensor per process.
-static SUBSCRIBED: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
+/// Whether `GpuiSensors` is reporting each sensor, so a screen that reads one
+/// every frame costs a single JNI call per subscription rather than per frame.
+static LISTENING: [AtomicBool; 4] = [const { AtomicBool::new(false) }; 4];
 
 pub fn available_sensors() -> SensorAvailability {
     jni_helpers::with_env(|env| {
@@ -41,33 +44,54 @@ pub fn available_sensors() -> SensorAvailability {
 }
 
 pub fn accelerometer() -> Option<SensorData> {
-    read(SensorKind::Accelerometer, SENSOR_ACCELEROMETER)
+    read(SensorKind::Accelerometer)
 }
 
 pub fn gyroscope() -> Option<SensorData> {
-    read(SensorKind::Gyroscope, SENSOR_GYROSCOPE)
+    read(SensorKind::Gyroscope)
 }
 
 pub fn magnetometer() -> Option<SensorData> {
-    read(SensorKind::Magnetometer, SENSOR_MAGNETOMETER)
+    read(SensorKind::Magnetometer)
 }
 
 pub fn barometer() -> Option<BarometerData> {
     // `Sensor.TYPE_PRESSURE` carries its one value in `values[0]`.
-    read(SensorKind::Barometer, SENSOR_BAROMETER).map(|d| BarometerData { pressure: d.x })
+    read(SensorKind::Barometer).map(|d| BarometerData { pressure: d.x })
 }
 
-/// Subscribe to `sensor` on the first read, then hand back the newest sample.
-fn read(kind: SensorKind, sensor: i32) -> Option<SensorData> {
-    if !SUBSCRIBED[kind.index()].swap(true, Ordering::AcqRel) {
-        if let Err(e) = subscribe(sensor) {
-            log::warn!("sensors: subscribing to {kind:?} failed: {e}");
-        }
+pub(crate) fn subscribe(
+    kind: SensorKind,
+    handler: impl Fn(SensorData) + Send + 'static,
+) -> Result<(), String> {
+    set_handler(kind, Some(Box::new(handler)));
+    // An app calling this took control of the subscription, so make a real
+    // attempt instead of honouring the once-per-sensor shortcut a poll uses --
+    // otherwise retrying after a failure would answer `Ok` while delivering
+    // nothing.
+    LISTENING[kind.index()].store(false, Ordering::Release);
+    start(kind)
+}
+
+pub(crate) fn unsubscribe(kind: SensorKind) -> Result<(), String> {
+    set_handler(kind, None);
+    LISTENING[kind.index()].store(false, Ordering::Release);
+    stop(kind)
+}
+
+/// Start reporting `kind` if it is not already, then hand back the newest sample.
+fn read(kind: SensorKind) -> Option<SensorData> {
+    if let Err(e) = start(kind) {
+        log::warn!("sensors: subscribing to {kind:?} failed: {e}");
     }
     latest(kind)
 }
 
-fn subscribe(sensor: i32) -> Result<(), String> {
+fn start(kind: SensorKind) -> Result<(), String> {
+    if LISTENING[kind.index()].swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+
     jni_helpers::with_env(|env| {
         let activity = jni_helpers::activity(env)?;
         let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
@@ -76,7 +100,7 @@ fn subscribe(sensor: i32) -> Result<(), String> {
             &cls,
             jni::jni_str!("start"),
             jni::jni_sig!("(Landroid/app/Activity;I)V"),
-            &[JValue::Object(&activity), JValue::Int(sensor)],
+            &[JValue::Object(&activity), JValue::Int(sensor_id(kind))],
         )
         .map_err(|e| {
             env.exception_clear();
@@ -87,7 +111,35 @@ fn subscribe(sensor: i32) -> Result<(), String> {
     })
 }
 
-/// Store a sample pushed by `GpuiSensors`.
+fn stop(kind: SensorKind) -> Result<(), String> {
+    jni_helpers::with_env(|env| {
+        let cls = jni_helpers::find_app_class(env, HELPER_CLASS)?;
+
+        env.call_static_method(
+            &cls,
+            jni::jni_str!("stop"),
+            jni::jni_sig!("(I)V"),
+            &[JValue::Int(sensor_id(kind))],
+        )
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+
+        Ok(())
+    })
+}
+
+fn sensor_id(kind: SensorKind) -> i32 {
+    match kind {
+        SensorKind::Accelerometer => SENSOR_ACCELEROMETER,
+        SensorKind::Gyroscope => SENSOR_GYROSCOPE,
+        SensorKind::Magnetometer => SENSOR_MAGNETOMETER,
+        SensorKind::Barometer => SENSOR_BAROMETER,
+    }
+}
+
+/// Store a sample pushed by `GpuiSensors` and deliver it to any subscriber.
 pub(crate) fn notify_sample(sensor: i32, x: f32, y: f32, z: f32) {
     let kind = match sensor {
         SENSOR_ACCELEROMETER => SensorKind::Accelerometer,
@@ -105,7 +157,7 @@ pub(crate) fn notify_sample(sensor: i32, x: f32, y: f32, z: f32) {
         y: y as f64,
         z: z as f64,
     };
-    if store_latest(kind, data) {
+    if dispatch_sample(kind, data) {
         // The read that subscribed returned `None` and drew nothing new, so
         // without a forced frame there would be no further read to notice this
         // sample. Reuses the platform's existing "state changed outside GPUI's
