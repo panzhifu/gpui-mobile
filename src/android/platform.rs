@@ -64,10 +64,12 @@ use gpui_wgpu::GpuContext;
 
 // ── stub: clipboard ───────────────────────────────────────────────────────────
 
-/// Android clipboard (thin wrapper over `ClipboardManager` via JNI).
+/// Android clipboard.
 ///
-/// A real implementation would call into Java via `jni-rs`; for now we use
-/// an in-process string store so the rest of the platform compiles.
+/// With the `clipboard` feature this goes through the system `ClipboardManager`
+/// (`dev.gpui.mobile.GpuiClipboard`), so text copied in GPUI can be pasted in other
+/// apps and vice versa. Without the feature, or when the JNI call fails (the host did
+/// not package `GpuiClipboard.java`), it falls back to an in-process string store.
 #[derive(Default)]
 pub struct AndroidClipboard {
     contents: Option<String>,
@@ -75,10 +77,19 @@ pub struct AndroidClipboard {
 
 impl AndroidClipboard {
     pub fn read(&self) -> Option<String> {
+        #[cfg(feature = "clipboard")]
+        match crate::packages::clipboard::get_text() {
+            Ok(text) => return text,
+            Err(err) => log::warn!("system clipboard read failed, using local copy: {err}"),
+        }
         self.contents.clone()
     }
 
     pub fn write(&mut self, text: String) {
+        #[cfg(feature = "clipboard")]
+        if let Err(err) = crate::packages::clipboard::set_text(&text) {
+            log::warn!("system clipboard write failed, keeping local copy: {err}");
+        }
         self.contents = Some(text);
     }
 
@@ -133,6 +144,15 @@ struct AndroidPlatformState {
 
     // ── windows / displays ────────────────────────────────────────────────────
     windows: WindowList,
+    /// The window `Platform::open_window` should hand to GPUI next.
+    ///
+    /// GPUI asks for "a window" with no way to say *which* native surface it means,
+    /// and on Android the surface always exists first. With one window that was fine —
+    /// `open_window` could just answer `primary`. Hosts that put several Activities on
+    /// screen (each with its own `SurfaceView`) need each `cx.open_window` to land on
+    /// the surface that Activity brought, so the host sets this immediately before
+    /// asking GPUI to open, and `open_window` takes it.
+    pending_window: Option<Arc<AndroidWindow>>,
     displays: DisplayList,
 
     // ── text ──────────────────────────────────────────────────────────────────
@@ -410,6 +430,7 @@ impl AndroidPlatform {
                 dispatcher,
                 gpu_context: Rc::new(RefCell::new(None)),
                 windows: WindowList::default(),
+                pending_window: None,
                 displays,
                 text_system,
                 clipboard: AndroidClipboard::default(),
@@ -623,6 +644,18 @@ impl AndroidPlatform {
             scale_factor
         );
         Ok(window)
+    }
+
+    /// Name the window the next [`Platform::open_window`] should return.
+    ///
+    /// Cleared by that call. See [`AndroidPlatformState::pending_window`].
+    pub fn set_pending_window(&self, window: Arc<AndroidWindow>) {
+        self.state.lock().pending_window = Some(window);
+    }
+
+    /// Take the window named by [`Self::set_pending_window`], if any.
+    pub fn take_pending_window(&self) -> Option<Arc<AndroidWindow>> {
+        self.state.lock().pending_window.take()
     }
 
     /// Remove and return the window identified by `id`.
@@ -1103,7 +1136,13 @@ impl Platform for AndroidPlatform {
         // MainEvent::InitWindow, not by the application.  If a window
         // already exists we wrap it in an AndroidPlatformWindow and hand
         // it to GPUI.
-        let window = self.primary_window().ok_or_else(|| {
+        //
+        // `take_pending_window` is what lets a host open more than one: it names the
+        // window this call is for. Without it every `cx.open_window` would answer with
+        // `primary`, so a second Activity's panel would render into the first
+        // Activity's surface.
+        let window = self.take_pending_window().or_else(|| self.primary_window());
+        let window = window.ok_or_else(|| {
             anyhow::anyhow!(
                 "AndroidPlatform::open_window — no native window available yet. \
                  Call this from the on_init_window callback after the surface is ready."
