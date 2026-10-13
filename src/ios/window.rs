@@ -14,6 +14,7 @@ use super::events::*;
 use super::IosDisplay;
 use crate::fling_guard::FlingGuard;
 use crate::frame_demand::FrameDemand;
+use crate::pinch_guard::PinchGuard;
 
 use gpui::{
     point, px, size, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTile,
@@ -593,6 +594,8 @@ pub(crate) struct IosWindow {
     active_touches: RefCell<HashMap<usize, gpui::TouchId>>,
     next_touch_id: Cell<u64>,
     fling_guard: RefCell<FlingGuard>,
+    /// Turns a second live contact into a pinch instead of a second pan.
+    pinch_guard: RefCell<PinchGuard>,
     /// The wgpu renderer (Metal backend on iOS).
     /// Wrapped in a `Mutex<Option<…>>` so that `draw()` (called from the
     /// `request_frame` callback) can acquire a mutable reference without
@@ -726,6 +729,7 @@ impl IosWindow {
                 active_touches: RefCell::new(HashMap::new()),
                 next_touch_id: Cell::new(0),
                 fling_guard: RefCell::new(FlingGuard::new()),
+                pinch_guard: RefCell::new(PinchGuard::new()),
                 renderer: Mutex::new(None),
             };
 
@@ -944,13 +948,18 @@ impl IosWindow {
                 predicted_position: None,
                 force: None,
             };
-            self.fling_guard.borrow_mut().relay(
-                event,
-                || self.next_touch_id(),
-                |event| {
-                    callback(PlatformInput::Touch(event));
-                },
-            );
+            // Preserve raw contacts for GPUI's recognizer, which owns tap
+            // synthesis, long press, claimed drags, panning and momentum;
+            // `FlingGuard` keeps a contact that stops a fling from inheriting
+            // its axis, and `PinchGuard` in front of it turns a second contact
+            // into a zoom instead of a second pan.
+            let mut pinch = self.pinch_guard.borrow_mut();
+            let mut fling = self.fling_guard.borrow_mut();
+            let mut next_id = || self.next_touch_id();
+            let mut emit = |input: PlatformInput| {
+                callback(input);
+            };
+            pinch.relay(event, &mut fling, &mut next_id, &mut emit);
         }
         if matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
             self.active_touches.borrow_mut().remove(&key);

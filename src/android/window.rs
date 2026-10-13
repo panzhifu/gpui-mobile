@@ -1807,6 +1807,8 @@ impl PlatformWindow for AndroidPlatformWindow {
         // Preserve raw contacts so GPUI can arbitrate long presses, claimed
         // control drags and ordinary pans, including hover suppression and inertia.
         // `FlingGuard` keeps a contact that stops a fling from inheriting its axis.
+        // `PinchGuard` sits in front of it: two contacts become a zoom rather than
+        // a pan, and everything else is relayed through the fling guard as it was.
         {
             let cb = Arc::clone(&input_cb);
             let window = Arc::downgrade(&self.window);
@@ -1818,6 +1820,7 @@ impl PlatformWindow for AndroidPlatformWindow {
             };
             let mut active_touches = HashMap::new();
             let mut fling_guard = crate::fling_guard::FlingGuard::new();
+            let mut pinch_guard = crate::pinch_guard::PinchGuard::new();
             self.window.on_touch(move |touch| {
                 let phase = match touch.action {
                     0 => gpui::TouchPhase::Started,
@@ -1849,8 +1852,8 @@ impl PlatformWindow for AndroidPlatformWindow {
                     force: None,
                 };
                 let mut cb = cb.lock();
-                fling_guard.relay(event, &mut next_touch_id, |event| {
-                    cb(gpui::PlatformInput::Touch(event));
+                pinch_guard.relay(event, &mut fling_guard, &mut next_touch_id, &mut |input| {
+                    cb(input);
                 });
                 if matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
                     active_touches.remove(&touch.id);

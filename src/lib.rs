@@ -80,6 +80,8 @@ pub(crate) mod frame_demand;
 pub(crate) mod frame_pacer;
 pub mod momentum;
 pub mod packages;
+#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+pub(crate) mod pinch_guard;
 pub mod platform_view;
 pub mod target_platform;
 
