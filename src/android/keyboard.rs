@@ -185,8 +185,9 @@ pub fn android_meta_caps_lock(meta_state: i32) -> bool {
 
 /// Convert an Android key code to a GPUI key name string.
 ///
-/// Returns `None` for key codes that should be ignored (e.g. pure modifier
-/// keys, volume buttons, etc.).
+/// Returns `None` for key codes that should be ignored: pure modifier keys, and
+/// system keys an app cannot act on (`HOME`, `VOLUME_MUTE`, …). The volume up and
+/// down keys are *not* ignored — see the note at their arms below.
 pub fn android_keycode_to_key(key_code: i32) -> Option<String> {
     let key = match key_code {
         // Letters
@@ -299,12 +300,22 @@ pub fn android_keycode_to_key(key_code: i32) -> Option<String> {
         AKEYCODE_MENU => "menu",
         AKEYCODE_BACK => "escape", // Map Android back button to escape
 
-        // Ignore pure modifier keys, volume, etc.
+        // The volume keys are reported rather than dropped, because an e-reader
+        // or a comic viewer wants them for page turns. The names carry no hyphen
+        // on purpose: `Keystroke::parse` splits a binding string on '-' and
+        // requires every leading component to name a modifier, so "volume-up"
+        // would not parse as a key at all. GPUI spells its own multi-key names
+        // the same way ("pageup", "pagedown").
+        AKEYCODE_VOLUME_UP => "volumeup",
+        AKEYCODE_VOLUME_DOWN => "volumedown",
+
+        // Ignore pure modifier keys and the keys no app can act on. Volume mute
+        // stays here: it reports no direction, so a consumer could only ignore
+        // it anyway.
         AKEYCODE_SHIFT_LEFT | AKEYCODE_SHIFT_RIGHT | AKEYCODE_CTRL_LEFT | AKEYCODE_CTRL_RIGHT
         | AKEYCODE_ALT_LEFT | AKEYCODE_ALT_RIGHT | AKEYCODE_META_LEFT | AKEYCODE_META_RIGHT
         | AKEYCODE_FUNCTION | AKEYCODE_CAPS_LOCK | AKEYCODE_NUM_LOCK | AKEYCODE_SCROLL_LOCK
-        | AKEYCODE_VOLUME_UP | AKEYCODE_VOLUME_DOWN | AKEYCODE_VOLUME_MUTE | AKEYCODE_HOME
-        | AKEYCODE_SYSRQ | AKEYCODE_BREAK => return None,
+        | AKEYCODE_VOLUME_MUTE | AKEYCODE_HOME | AKEYCODE_SYSRQ | AKEYCODE_BREAK => return None,
 
         // Unknown / unmapped
         _ => return None,
@@ -516,10 +527,31 @@ mod tests {
     }
 
     #[test]
-    fn volume_keys_are_ignored() {
-        assert_eq!(android_keycode_to_key(AKEYCODE_VOLUME_UP), None);
-        assert_eq!(android_keycode_to_key(AKEYCODE_VOLUME_DOWN), None);
+    fn the_volume_keys_report_a_bindsable_name() {
+        assert_eq!(
+            android_keycode_to_key(AKEYCODE_VOLUME_UP),
+            Some("volumeup".to_string())
+        );
+        assert_eq!(
+            android_keycode_to_key(AKEYCODE_VOLUME_DOWN),
+            Some("volumedown".to_string())
+        );
         assert_eq!(android_keycode_to_key(AKEYCODE_VOLUME_MUTE), None);
+
+        // A name GPUI cannot parse is a key nobody can bind, and the hyphen is
+        // the trap: `Keystroke::parse` reads every leading `-`-separated
+        // component as a modifier, so "volume-up" is rejected while "volumeup"
+        // is taken as the key itself.
+        let bound = gpui::Keystroke::parse("volumeup").expect("'volumeup' must parse as a key");
+        assert!(gpui::Keystroke::parse("volume-up").is_err());
+
+        // What the platform reports has to equal what a binding names, or the
+        // key event arrives and no handler ever matches it.
+        let pressed = android_key_to_keystroke(AKEYCODE_VOLUME_UP, 0, 0).expect("volume up maps");
+        assert_eq!(
+            pressed, bound,
+            "the reported keystroke is the bound keystroke"
+        );
     }
 
     #[test]
