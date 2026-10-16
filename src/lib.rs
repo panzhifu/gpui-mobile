@@ -144,6 +144,28 @@ pub fn set_system_chrome(style: &SystemChromeStyle) {
     }
 }
 
+/// Override this app window's screen brightness, or hand it back to the system.
+///
+/// `Some(v)` asks for `v` of full brightness (0.0–1.0; going below the system minimum is
+/// allowed — that is what makes the low end useful for reading in the dark). `None`
+/// clears the override.
+///
+/// On Android this is `WindowManager.LayoutParams.screenBrightness` for the app's own
+/// window: no permission is needed, and no other app is affected. On iOS the only hook is
+/// the device-wide brightness setting, which this crate deliberately does not touch, and on
+/// desktop there is no window-level hook at all — both are no-ops, so a caller keeps one
+/// code path and dims its own content if it needs to go darker than the platform allows.
+pub fn set_screen_brightness(value: Option<f32>) {
+    #[cfg(target_os = "android")]
+    {
+        android::jni::set_screen_brightness(value);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = value;
+    }
+}
+
 // ── Text input callback ──────────────────────────────────────────────────────
 
 use std::cell::RefCell;

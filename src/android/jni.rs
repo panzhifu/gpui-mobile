@@ -702,6 +702,10 @@ pub fn run_event_loop(app: &AndroidApp) {
             log::info!("deferred: TerminateWindow (iter={})", iteration);
             INIT_WINDOW_DONE.store(false, Ordering::Relaxed);
             *LAST_CHROME_STYLE.lock().unwrap() = None;
+            // A new window comes back with default attributes, so the brightness the
+            // reader asked for is gone with the old one — forget it and let the next
+            // frame send it again.
+            *LAST_BRIGHTNESS.lock().unwrap() = None;
             if let Some(platform) = PLATFORM.get() {
                 if let Some(win) = platform.primary_window() {
                     win.term_window();
@@ -1408,6 +1412,116 @@ pub fn set_system_chrome(style: &crate::SystemChromeStyle) {
         style.navigation_bar_color,
         style.status_bar_style
     );
+}
+
+// ── screen brightness (window-level override) ────────────────────────────────
+
+/// Cached last-applied brightness override, in the Java `float` form.
+///
+/// Same reason as [`LAST_CHROME_STYLE`]: the round trip goes through `Window`, and firing
+/// it every frame would contend with the Android UI thread.  A `None` here means "nothing
+/// has been applied yet" — the *system-following* value is the `-1.0` sentinel, not `None`.
+static LAST_BRIGHTNESS: std::sync::Mutex<Option<f32>> = std::sync::Mutex::new(None);
+
+/// Override this app window's screen brightness.
+///
+/// `Some(v)` writes `WindowManager.LayoutParams.screenBrightness` (0.0–1.0; going below
+/// the system minimum is the whole point of the low end), `None` writes
+/// `BRIGHTNESS_OVERRIDE_NONE` (-1.0) and hands the backlight back to the system.
+///
+/// Window-scoped, so it needs no permission and never changes another app or the system
+/// setting: passing `None` — or the window going away — is the way back.
+///
+/// `Window.getAttributes()` copies out a `LayoutParams`, so writing the field alone does
+/// nothing: the same object has to go back through `Window.setAttributes()` before the
+/// window manager sees it.
+///
+/// Must be called from the native (GPUI) thread that has JNI access; see
+/// [`set_system_chrome`] for what that does and does not guarantee against the UI thread.
+/// A Java-side refusal is cleared rather than propagated — a brightness slider that fails
+/// must not take the reader's page down with it.  A rejected call also drops the cache, so
+/// the next one retries instead of believing the window already looks that way.
+pub fn set_screen_brightness(value: Option<f32>) {
+    // Clamp at the boundary: Java takes 0.0–1.0 or the -1.0 sentinel, and a NaN there
+    // would leave the window stuck at an undefined brightness for the session.
+    let wanted = match value {
+        Some(v) if v.is_finite() => v.clamp(0.0, 1.0),
+        _ => -1.0,
+    };
+
+    {
+        let mut last = LAST_BRIGHTNESS.lock().unwrap();
+        if *last == Some(wanted) {
+            return;
+        }
+        *last = Some(wanted);
+    }
+
+    let result = with_env(|env| {
+        let activity_obj = activity(env)?;
+
+        let window = env
+            .call_method(
+                &activity_obj,
+                jni::jni_str!("getWindow"),
+                jni::jni_sig!("()Landroid/view/Window;"),
+                &[],
+            )
+            .and_then(|v: jni::objects::JValueOwned| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if window.is_null() {
+            return Err("getWindow returned null".into());
+        }
+
+        let attrs = env
+            .call_method(
+                &window,
+                jni::jni_str!("getAttributes"),
+                jni::jni_sig!("()Landroid/view/WindowManager$LayoutParams;"),
+                &[],
+            )
+            .and_then(|v: jni::objects::JValueOwned| v.l())
+            .map_err(|e| {
+                env.exception_clear();
+                e.to_string()
+            })?;
+        if attrs.is_null() {
+            return Err("getAttributes returned null".into());
+        }
+
+        env.set_field(
+            &attrs,
+            jni::jni_str!("screenBrightness"),
+            jni::jni_sig!("F"),
+            JValue::Float(wanted),
+        )
+        .map_err(|e| e.to_string())?;
+
+        env.call_method(
+            &window,
+            jni::jni_str!("setAttributes"),
+            jni::jni_sig!("(Landroid/view/WindowManager$LayoutParams;)V"),
+            &[JValue::Object(&attrs)],
+        )
+        .map(|_| ())
+        .map_err(|e| {
+            env.exception_clear();
+            e.to_string()
+        })?;
+
+        Ok(())
+    });
+
+    match result {
+        Ok(()) => log::info!("set_screen_brightness: {wanted}"),
+        Err(e) => {
+            *LAST_BRIGHTNESS.lock().unwrap() = None;
+            log::warn!("set_screen_brightness: {e}");
+        }
+    }
 }
 
 // ── software keyboard (IME) control ───────────────────────────────────────────
