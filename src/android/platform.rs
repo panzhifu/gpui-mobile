@@ -1111,6 +1111,10 @@ impl Platform for AndroidPlatform {
             .collect()
     }
 
+    fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {
+        // Displays are fixed for the lifetime of the Android window.
+    }
+
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         self.state
             .lock()
@@ -1444,6 +1448,9 @@ impl Platform for SharedPlatform {
     }
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         <AndroidPlatform as Platform>::displays(&self.0)
+    }
+    fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_displays_changed(&self.0, callback)
     }
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         <AndroidPlatform as Platform>::primary_display(&self.0)

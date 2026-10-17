@@ -246,6 +246,12 @@ impl PlatformDisplay for AndroidDisplay {
             size: gpui::size(gpui::px(logical.width.0), gpui::px(logical.height.0)),
         }
     }
+
+    fn refresh_interval(&self) -> Option<std::time::Duration> {
+        // Android does not expose the display's refresh rate through the NDK
+        // surface API used here. `None` lets GPUI fall back to its clock.
+        None
+    }
 }
 
 impl fmt::Display for AndroidDisplay {

@@ -1972,6 +1972,11 @@ impl PlatformWindow for AndroidPlatformWindow {
         // Android windows don't move — they're always fullscreen.
     }
 
+    fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {
+        // Android windows are bound to one surface; the host recreates the
+        // surface when the display changes.
+    }
+
     fn on_should_close(&self, _callback: Box<dyn FnMut() -> bool>) {
         // Android app lifecycle is managed by the system.
     }
