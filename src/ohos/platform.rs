@@ -192,18 +192,32 @@ pub struct OhosPlatform {
 }
 
 /// System font paths probed at startup (ordered by preference).
+///
+/// 裸名字排在带字重的猜测之前，因为当前这台镜像发的就是裸名字
+/// （`HarmonyOS_Sans.ttf` / `HarmonyOS_Sans_SC.ttf`），而 `_Regular` / `_Medium`
+/// 那一套是另一些镜像的写法。这份表是探测不是要求 —— 读不到只是一条 debug —— 但排序
+/// 错了是**静默**的：Latin 从任何一个加载成功的面里都出得来，CJK 只有 SC 那一份有字形，
+/// 没读到就是一整屏 `.notdef` 豆腐块（实测装机第一帧就是这样）。
 const SYSTEM_FONT_PATHS: &[&str] = &[
-    // HarmonyOS Sans (Latin + CJK)
+    // HarmonyOS Sans — Latin / 通用
+    "/system/fonts/HarmonyOS_Sans.ttf",
+    "/system/fonts/HarmonyOS_Sans_Italic.ttf",
+    "/system/fonts/HarmonyOS_Sans_Condensed.ttf",
+    "/system/fonts/HarmonyOS_Sans_Condensed_Italic.ttf",
+    // CJK：SC 在前（folio 的界面是简体中文），TC 兜底
+    "/system/fonts/HarmonyOS_Sans_SC.ttf",
+    "/system/fonts/HarmonyOS_Sans_TC.ttf",
+    // 同一批名字的带字重写法
     "/system/fonts/HarmonyOS_Sans_Regular.ttf",
     "/system/fonts/HarmonyOS_Sans_Medium.ttf",
     "/system/fonts/HarmonyOS_Sans_Bold.ttf",
     "/system/fonts/HarmonyOS_Sans_Light.ttf",
-    "/system/fonts/HarmonyOS_Sans_Italic.ttf",
     "/system/fonts/HarmonyOS_Sans_SC_Regular.ttf",
     "/system/fonts/HarmonyOS_Sans_SC_Medium.ttf",
     "/system/fonts/HarmonyOS_Sans_SC_Bold.ttf",
     "/system/fonts/HarmonyOS_Sans_TC_Regular.ttf",
     // Non-Latin HarmonyOS Sans variants
+    "/system/fonts/HarmonyOS_Sans_Naskh_Arabic.ttf",
     "/system/fonts/HarmonyOS_Sans_Naskh_Arabic_Regular.ttf",
     "/system/fonts/HarmonyOS_Sans_Devanagari_Regular.ttf",
     "/system/fonts/HarmonyOS_Sans_Thai_Regular.ttf",
@@ -212,7 +226,11 @@ const SYSTEM_FONT_PATHS: &[&str] = &[
     "/system/fonts/NotoSans-Regular.ttf",
     "/system/fonts/NotoSans-Bold.ttf",
     "/system/fonts/NotoSansMono-Regular.ttf",
-    // Emoji (CBDT/COLR depending on build)
+    // Emoji: 这两份**不要**加进来。`HMOSColorEmojiCompat.ttf` 一旦进 fontdb，gpui
+    // 就把它的家族名 `HMOS Color Emoji` 当 emoji 首选去 resolve，而那份面没有 gpui 期待
+    // 的那个 style —— 结果是 `failed to resolve font 'HMOS Color Emoji' or any of the
+    // fallbacks` 直接 panic 在 `text_system.rs`（装机实测，第一次画字就撞）。鸿蒙的
+    // emoji 与 Android 同解：随包带一份，见 `android` 臂的 bundled emoji font。
     "/system/fonts/NotoColorEmoji.ttf",
     "/system/fonts/HarmonyOS_Sans_Emoji.ttf",
 ];
