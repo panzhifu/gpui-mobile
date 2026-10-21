@@ -231,6 +231,16 @@ pub extern "C" fn ohos_napi_init(
     env: gpui_mobile::ohos::napi::NapiEnv,
     exports: gpui_mobile::ohos::napi::NapiValue,
 ) -> gpui_mobile::ohos::napi::NapiValue {
+    // 与 Android 那条臂的 `android_logger::init_once`、iOS 那条臂的 `NsLogLogger`
+    // 同一步。少了它，`src/ohos` 里所有 `log::*` 都进不了 hilog —— 实测过一次代价很
+    // 高的排查：native 侧一行都不出，看起来像整条链没跑，而同一进程里 ArkTS 的
+    // `hilog.info` 一直正常。
+    gpui_mobile::ohos::init_logger();
+    // panic hook —— 同样为了别再瞎。`-Z build-std=std,panic_abort` 下 panic 直接
+    // abort，默认那份只写 stderr；faultlog 里剩的就只有裸 PC。
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("GPUI PANIC: {info}");
+    }));
     // SAFETY: `env` / `exports` come straight from the NAPI runtime.
     unsafe {
         gpui_mobile::ohos::napi::install(
