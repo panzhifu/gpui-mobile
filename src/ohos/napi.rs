@@ -45,11 +45,11 @@ use std::ffi::{c_char, c_double, c_int, c_void, CStr};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use gpui::{App, Application};
+use gpui::{App, Application, ApplicationHandle};
 
 use super::platform::{self, OhosPlatform, SharedPlatform};
 use super::window::OhosNativeWindow;
-use super::{vsync, xcomponent};
+use super::{main_thread, vsync, xcomponent};
 
 // ── NAPI ABI ──────────────────────────────────────────────────────────────────
 
@@ -218,6 +218,16 @@ macro_rules! gpui_ohos_napi_module {
 
 static PLATFORM: OnceLock<Arc<OhosPlatform>> = OnceLock::new();
 static APP_CB: Mutex<Option<Box<dyn FnOnce(&mut App) + Send>>> = Mutex::new(None);
+
+/// GPUI's `ApplicationHandle`, kept alive for the process so the `App` outlives the
+/// non-blocking `Platform::run` that created it.
+///
+/// It travels as a raw `Box` pointer because the handle is an `Rc` and therefore
+/// neither `Send` nor `Sync`. Only the UI thread writes it, and the only read is the
+/// null check that keeps the runtime's second module-init pass from starting a
+/// second app.
+static APP_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
 static NAPI_ENV: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static KEYBOARD_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -259,6 +269,14 @@ pub unsafe fn install(
     NAPI_ENV.store(env, Ordering::Release);
     *APP_CB.lock() = Some(app_cb);
 
+    // The UI-thread hop is deliberately **not** created here. This callback runs
+    // while the module is loading, and a `napi_threadsafe_function` built from
+    // that env is tied to an app context that is gone by the time the first frame
+    // arrives: measured on the emulator, the ring reported `app was released`
+    // ~95 times a second and nothing was ever drained. The hop is therefore
+    // created from the first live ArkTS → native call (see
+    // [`ensure_main_thread_hop`]).
+
     // 1. Register the plain NAPI functions ArkTS calls directly.
     register_function(env, exports, c"nativeInit", native_init);
     register_function(env, exports, c"nativeSetDensity", native_set_density);
@@ -278,18 +296,37 @@ pub unsafe fn install(
         native_set_keyboard_callback,
     );
 
-    // 2. Create the platform singleton and start the (non-blocking) GPUI app.
+    // 2. Create the platform singleton and start the (non-blocking) GPUI app —
+    //    exactly once, and keep the handle.
+    //
+    //    Two things go wrong without this guard. The runtime calls the module init
+    //    a second time when it binds the XComponent (`__NATIVE_XCOMPONENT_OBJ__`
+    //    only exists on that pass), and a second `Application::run` overwrites the
+    //    launch callback the first one is still waiting on — which drops the first
+    //    `Rc<AppCell>`. And `Platform::run` returns immediately on OHOS, so the
+    //    handle *is* the app's last strong reference: dropping it releases the App
+    //    the moment the statement ends, and every later frame dies in
+    //    `AsyncWindowContext::update_window` with "app was released". Android's
+    //    host stores the same handle for the same reason.
     let platform = PLATFORM
         .get_or_init(|| Arc::new(OhosPlatform::new(false)))
         .clone();
 
-    let run_platform = SharedPlatform::new(platform.clone()).into_rc();
-    Application::with_platform(run_platform).run(|cx: &mut App| {
-        if let Some(cb) = APP_CB.lock().take() {
-            log::info!("napi: invoking app callback");
-            cb(cx);
-        }
-    });
+    if APP_HANDLE.load(Ordering::Acquire).is_null() {
+        let run_platform = SharedPlatform::new(platform.clone()).into_rc();
+        let handle = Application::with_platform(run_platform).run_embedded(|cx: &mut App| {
+            if let Some(cb) = APP_CB.lock().take() {
+                log::info!("napi: invoking app callback");
+                cb(cx);
+            }
+        });
+        // The `Box` is deliberately never freed: the App lives for the process, and
+        // OHOS has no ordered teardown to hand it back to.
+        let boxed: Box<ApplicationHandle> = Box::new(handle);
+        APP_HANDLE.store(Box::into_raw(boxed).cast(), Ordering::Release);
+    } else {
+        log::debug!("napi: the app is already running; not starting a second one");
+    }
 
     // 3. Bind the XComponent, if the runtime provided one.
     if let Err(e) = bind_xcomponent(env, exports, platform) {
@@ -512,7 +549,19 @@ fn undefined(env: NapiEnv) -> NapiValue {
 
 // ── exported JS functions ─────────────────────────────────────────────────────
 
+/// Create the UI-thread hop from a live ArkTS callback, once.
+///
+/// Every early entry point gets a shot because the order across hosts is not
+/// guaranteed (`nativeInit` can land after `OnSurfaceCreated`), and the cost after
+/// the first success is one atomic load.
+fn ensure_main_thread_hop(env: NapiEnv) {
+    if !main_thread::is_ready() {
+        unsafe { main_thread::init(env) };
+    }
+}
+
 extern "C" fn native_init(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    ensure_main_thread_hop(env);
     log::info!("napi: nativeInit()");
     undefined(env)
 }
@@ -520,6 +569,7 @@ extern "C" fn native_init(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
 /// `nativeSetDensity(scale)` — display density relative to 160 dpi
 /// (= `display.getDefaultDisplaySync().densityDPI / 160`).
 extern "C" fn native_set_density(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    ensure_main_thread_hop(env);
     let (argc, argv) = read_args::<1>(env, info);
     if argc >= 1 {
         if let Some(scale) = arg_f64(env, argv[0]) {
@@ -532,6 +582,7 @@ extern "C" fn native_set_density(env: NapiEnv, info: NapiCallbackInfo) -> NapiVa
 
 /// `nativeSetSafeAreaInsets(top, bottom, left, right)` — logical pixels.
 extern "C" fn native_set_safe_area_insets(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    ensure_main_thread_hop(env);
     let (argc, argv) = read_args::<4>(env, info);
     if argc >= 4 {
         let top = arg_f64(env, argv[0]).unwrap_or(0.0) as f32;
@@ -545,6 +596,7 @@ extern "C" fn native_set_safe_area_insets(env: NapiEnv, info: NapiCallbackInfo) 
 }
 
 extern "C" fn native_on_foreground(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    ensure_main_thread_hop(env);
     log::info!("napi: onForeground");
     if let Some(p) = try_platform() {
         p.did_become_active();

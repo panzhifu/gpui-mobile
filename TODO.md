@@ -1,8 +1,12 @@
 - HarmonyOS / OpenHarmony: implement the `packages/*` bridges (they are stubs on
   `target_env = "ohos"` — each needs a NAPI/ArkTS implementation). The core
-  platform layer (rendering, touch input, lifecycle) is implemented.
-- HarmonyOS: validate the backend on a physical device / emulator, and wire the
-  software keyboard through `@ohos.inputMethod` (currently best-effort).
+  platform layer (rendering, touch input, lifecycle) is implemented and runs a live
+  frame loop on the emulator.
+- HarmonyOS: validate the backend on a **physical device**. The x86_64 emulator is
+  validated (links, installs, lays out and renders a scene every frame) but cannot
+  show pixels: its GLES is Mesa reporting 3.0, with no SSBOs for gpui_wgpu's
+  instance data. Also wire the software keyboard through `@ohos.inputMethod`
+  (currently best-effort).
 - Improve the UX of the APIs exposed by the library.
 - Assitive technologies support (e.g., screen readers, voice control).
 - Deeplinking?

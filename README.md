@@ -163,9 +163,14 @@ The `ohos` backend mirrors the Android one. Key points:
   (`type: SURFACE`) hands native code an `OHNativeWindow`, which is passed to
   wgpu as a `raw_window_handle::OhosNdkWindowHandle`. wgpu's Vulkan backend has
   no OHOS surface support, so GLES is used.
-- Frames are driven by `OH_NativeVSync`; touch input arrives through the
-  XComponent `DispatchTouchEvent` callback and is turned into GPUI mouse /
-  scroll events (with momentum scrolling) exactly like Android.
+- Frames are driven by `OH_NativeVSync`; its callback arrives on a vsync thread the
+  platform picks, so the trampoline never runs a frame — it posts one to
+  `ohos::main_thread` (a `napi_threadsafe_function` ring) and re-arms. GPUI's `App`
+  lives on the UI thread, and `gpui-pre-scheduler` stamps every local task with the
+  `ThreadId` that spawned it, so running a frame on the vsync thread aborts on the
+  first foreground task rather than merely running slowly. Touch input arrives
+  through the XComponent `DispatchTouchEvent` callback and is turned into GPUI mouse
+  / scroll events (with momentum scrolling) exactly like Android.
 - Entry point is a Node-API module registered from `example/src/lib.rs` via
   `gpui_mobile::gpui_ohos_napi_module!`. The ArkTS `EntryAbility` forwards
   density, safe-area insets and lifecycle events to native code.
@@ -181,18 +186,30 @@ The `ohos` backend mirrors the Android one. Key points:
 > host): the `.so` links, the HAP installs **without signing**, the module
 > loads, its NAPI exports are callable, `OH_NativeXComponent_RegisterCallback`
 > returns success, `OnSurfaceCreated` reaches native with the real window size,
-> and a wgpu device is created. It then dies in `create_bind_group_layout`
-> (`instances_layout` binding 0) because that driver reports
-> `storage_buffers_per_stage = 0` and lacks `DownlevelFlags::VERTEX_STORAGE` —
-> GLES 3.0 has no SSBOs, and gpui_wgpu keeps its instance data in a storage
-> buffer. **So: no frame on that emulator, for a driver reason, not a code
-> reason.** A physical HarmonyOS phone (GLES 3.2) has not been tested here.
+> a wgpu device is created, and the frame loop runs — GPUI lays the screen out
+> and renders a scene (`Router: render() screen=Home`, then 20 quads and 199
+> monochrome sprites per frame). Nothing aborts; the app sits there drawing.
 >
-> Two things that looked like bugs during that investigation, both now fixed:
-> `hilog`'s `LogType` is `LOG_APP = 0` in the current SDK (the old
-> `1 = APP` numbering silently drops every native log line), and the OHOS
-> system libraries must be linked explicitly — that now lives in the `#[link]`
-> attributes in `src/ohos/mod.rs`, not in each downstream's build script.
+> What it cannot do is bind that scene. The driver reports
+> `storage_buffers_per_stage = 0` and `max_storage_buffer_binding_size = 0`, and
+> lacks `DownlevelFlags::VERTEX_STORAGE` — GLES 3.0 has no SSBOs, and gpui_wgpu
+> keeps its instance data in a storage buffer. Per frame the renderer then says
+> `PipelineLayout with 'poly_sprites_layout' label is invalid` and
+> `scene too large: … instance data needs 3200 bytes, above the maximum of 0`.
+> **So: no pixels on that emulator, for a driver reason, not a code reason.** A
+> physical HarmonyOS phone (GLES 3.2) has not been tested here.
+>
+> Four things that looked like bugs during that investigation, all now fixed:
+> `hilog`'s `LogType` is `LOG_APP = 0` in the current SDK (the old `1 = APP`
+> numbering silently drops every native log line); the OHOS system libraries
+> must be linked explicitly, which now lives in the `#[link]` attributes in
+> `src/ohos/mod.rs` rather than in each downstream's build script; a frame must
+> not run on the vsync thread (see above); and the app has to be started with
+> `Application::run_embedded` with the returned `ApplicationHandle` kept alive —
+> `Platform::run` returns immediately here, so dropping that handle releases the
+> `App`, and the runtime calls the module init a *second* time when it binds the
+> XComponent, so a second `run` also overwrites the launch callback the first one
+> is waiting on. Both show up as `app was released` sixty times a second.
 >
 > The software keyboard is best-effort (driven from ArkTS via
 > `@ohos.inputMethod`); hardware key events already work.
@@ -222,17 +239,19 @@ frame and the glyph and image tiles the offscreen windows uploaded are released.
 
 It needs `gpui-pre-wgpu`'s headless renderer, which upstream only builds for
 tests and benchmarks and which picks a Vulkan/GL device that iOS lacks. That
-patched renderer lives in its own repository —
-[`panzhifu/gpui-pre-wgpu`](https://github.com/panzhifu/gpui-pre-wgpu), 0.3.9,
-with the renderer behind an `offscreen` feature, a constructor that takes the
-wgpu instance, and methods that release its render target and clear its sprite
-atlas. This repository patches to it; an application enabling `offscreen` must
-patch the same way (cargo only reads a git source's root manifest, so pointing
-at a subdirectory of another repo is not an option):
+patched renderer lives in [`panzhifu/gpui-folio`](https://github.com/panzhifu/gpui-folio)
+— the same tree that carries the page-curl fork of `gpui-pre`, so the two are
+pinned together at one rev — with the renderer behind an `offscreen` feature, a
+constructor that takes the wgpu instance, methods that release its render target
+and clear its sprite atlas, and a `request_device` that asks for the limits the
+adapter actually reports. This repository patches to it; an application enabling
+`offscreen` must patch the same way (cargo only reads a git source's root
+manifest, so pointing at a subdirectory of another repo is not an option):
 
 ```toml
 [patch.crates-io]
-gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-pre-wgpu", rev = "617a93340cd282e859a75e6fc710f735b8c17b6c" }
+gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "002b89f54338e4a13f8a361885cf2d5c1f4323b2" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "002b89f54338e4a13f8a361885cf2d5c1f4323b2" }
 ```
 
 ## Screenshots

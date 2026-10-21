@@ -165,6 +165,7 @@ pub mod dispatcher;
 pub mod display;
 pub mod keyboard;
 pub mod logging;
+pub mod main_thread;
 pub mod napi;
 pub mod platform;
 pub mod vsync;

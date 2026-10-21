@@ -8,6 +8,11 @@
 //! 1. drains the foreground task queue (`OhosDispatcher`), and
 //! 2. invokes the window's `request_frame` callback (layout → paint → present).
 //!
+//! "main-thread" is doing work in that sentence: the vsync callback arrives on a
+//! vsync thread the platform picks, so [`vsync_trampoline`] only posts the frame
+//! to [`super::main_thread`] and re-arms. Running it there instead keeps GPUI's
+//! `App` on one thread — see that module for what happens when it doesn't.
+//!
 //! A second `request_frame` while one is already pending is a no-op, so the
 //! waker installed on the dispatcher (see `napi.rs`) can safely call
 //! [`VsyncDriver::request_frame`] to shorten latency.
@@ -79,12 +84,42 @@ impl VsyncDriver {
             self.running.store(false, Ordering::Release);
         }
     }
+
+    /// Run one frame: the platform tick (which drains GPUI's foreground queue) and
+    /// the window's own `request_frame`.
+    ///
+    /// Only ever called from the UI thread, via [`super::main_thread`]. Re-checks
+    /// `running` because a stop may have landed between the hop and this.
+    fn run_frame(&self) {
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
+        let cb = {
+            let mut guard = self.frame_cb.lock();
+            guard.take()
+        };
+        if let Some(mut cb) = cb {
+            cb();
+            let mut guard = self.frame_cb.lock();
+            if guard.is_none() {
+                *guard = Some(cb);
+            }
+        }
+    }
 }
 
 /// The global driver singleton.
 static DRIVER: OnceLock<VsyncDriver> = OnceLock::new();
 
+/// Set once the first missing-hop warning is logged, so a startup gap can't flood
+/// hilog at 60 Hz.
+static HOP_MISS_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Static trampoline invoked by the runtime every vsync.
+///
+/// This runs on a vsync thread chosen by the platform, **not** on the thread that
+/// owns GPUI's `App` — so it never runs a frame here. It posts the frame to
+/// [`super::main_thread`] and re-arms.
 extern "C" fn vsync_trampoline(_timestamp: i64, data: *mut c_void) {
     if data.is_null() {
         return;
@@ -97,20 +132,23 @@ extern "C" fn vsync_trampoline(_timestamp: i64, data: *mut c_void) {
         return;
     }
 
-    // 1. Run the frame callback (which pumps momentum + the platform tick).
-    let cb = {
-        let mut guard = driver.frame_cb.lock();
-        guard.take()
-    };
-    if let Some(mut cb) = cb {
-        cb();
-        let mut guard = driver.frame_cb.lock();
-        if guard.is_none() {
-            *guard = Some(cb);
-        }
+    // 1. Hop onto the UI thread to run the frame. The driver pointer travels as a
+    //    `usize` so the closure stays `Send`.
+    let raw = data as usize;
+    if !super::main_thread::post(Box::new(move || {
+        // SAFETY: `raw` is the `&VsyncDriver` the runtime handed us; the driver is
+        // a 'static singleton and this closure runs on the thread that owns GPUI.
+        unsafe { &*(raw as *const VsyncDriver) }.run_frame();
+    })) && !HOP_MISS_WARNED.swap(true, Ordering::Relaxed)
+    {
+        // There is no hop until the first live ArkTS → native call. Frames are
+        // dropped meanwhile, and vsync re-arms, so this is a gap of a few frames
+        // rather than a dead app.
+        log::warn!("vsync: no UI-thread hop yet; dropping frames until a native_* call lands");
     }
 
-    // 2. Re-arm for the next frame.
+    // 2. Re-arm for the next frame. Asking for vsync is the one thing this thread
+    //    is for.
     driver.request_frame();
 }
 
