@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "GPUI mobile example"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "GPUI mobile example for HarmonyOS"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "GPUI Example"
+    }
+  ]
+}

@@ -131,6 +131,28 @@ accesskit_android = "0.7.5"
 rustc-hash = "2"
 uuid       = { version = "1", features = ["v5"] }
 
+# ── HarmonyOS / OpenHarmony ──────────────────────────────────────────────────
+#
+# The OHOS triple is `aarch64-unknown-linux-ohos` / `x86_64-unknown-linux-ohos` —
+# i.e. `target_os = "linux"` with `target_env = "ohos"`. Rendering goes through
+# wgpu's GLES/EGL backend (wgpu-hal has explicit `OhosNdk` support); the Vulkan
+# backend has no OHOS surface support. We deliberately do NOT enable gpui_wgpu's
+# `font-kit` feature on OHOS — the cosmic-text font database is populated from
+# `/system/fonts` at runtime instead.
+#
+# 渲染器取的是这条线上的 `gpui-pre-wgpu`（根上那条 `[patch.crates-io]` 指向
+# `panzhifu/gpui-pre-wgpu`），**不是** zed 上游那份 `gpui_wgpu`：两者挂在不同的
+# gpui 上，混进来就是第二棵 `Window` / `Element`。`wgpu` 与 iOS 段同一个版本号，
+# 好与 gpui-pre-wgpu 里那份合成一棵。
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.9" }
+wgpu = "29.0.4"
+
+libc       = "0.2"
+rustc-hash = "2"
+uuid       = { version = "1", features = ["v5"] }
+
 # ── dev ──────────────────────────────────────────────────────────────────────
 
 [dev-dependencies]

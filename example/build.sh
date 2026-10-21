@@ -5,6 +5,7 @@
 # Usage:
 #   ./build.sh ios   [--device | --simulator] [--release] [--clean]
 #   ./build.sh android [--device | --emulator] [--release] [--clean]
+#   ./build.sh ohos    [--device | --emulator] [--release] [--clean]
 #
 # Subcommands:
 #   ios       Build the Rust static library, generate the Xcode project via
@@ -15,12 +16,16 @@
 #             via Gradle, and install+launch on a connected Android device
 #             (default) or emulator.
 #
+#   ohos      Build the Rust shared library (nightly + -Z build-std), assemble
+#             the HAP via hvigor, and install+launch via hdc on a connected
+#             HarmonyOS / OpenHarmony device or emulator.
+#
 # Options:
-#   --device      Target a physical device (default for both platforms).
+#   --device      Target a physical device (default for all platforms).
 #   --simulator   (iOS only) Target the iOS Simulator instead of a device.
-#   --emulator    (Android only) Target an Android emulator instead of a device.
+#   --emulator    (Android/OHOS) Target an emulator instead of a device.
 #   --release     Build in release mode (default is debug).
-#   --clean       Run a clean build (cargo clean + xcode/gradle clean).
+#   --clean       Run a clean build (cargo clean + xcode/gradle/hvigor clean).
 #   --no-run      Build only — do not install or launch the app.
 #   -h, --help    Show this help message.
 #
@@ -29,6 +34,8 @@
 #            aarch64-apple-ios / aarch64-apple-ios-sim
 #   Android: Android SDK + NDK, cargo-ndk (cargo install cargo-ndk),
 #            rustup target aarch64-linux-android
+#   OHOS:    OpenHarmony SDK (set OHOS_NDK to the SDK's 'native' dir),
+#            nightly Rust with rust-src, hvigorw + hdc on PATH
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -41,6 +48,7 @@ GPUI_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 EXAMPLES_DIR="$SCRIPT_DIR"
 IOS_DIR="$EXAMPLES_DIR/ios"
 ANDROID_GRADLE_DIR="$EXAMPLES_DIR/android/gradle"
+OHOS_DIR="$EXAMPLES_DIR/ohos"
 
 # ── Colours (if stdout is a terminal) ────────────────────────────────────────
 
@@ -67,15 +75,17 @@ usage() {
 Usage:
   ./build.sh ios     [--device|--simulator] [--release] [--clean] [--no-run]
   ./build.sh android [--device|--emulator]  [--release] [--clean] [--no-run]
+  ./build.sh ohos    [--device|--emulator]  [--release] [--clean] [--no-run]
 
 Subcommands:
   ios       Build & run on iOS (physical device by default)
   android   Build & run on Android (physical device by default)
+  ohos      Build & run on HarmonyOS / OpenHarmony (device or emulator)
 
 Options:
   --device      Target a physical device (default)
   --simulator   (iOS) Target the iOS Simulator
-  --emulator    (Android) Target an Android emulator
+  --emulator    (Android/OHOS) Target an emulator
   --release     Release build (default: debug)
   --clean       Clean before building
   --no-run      Build only — skip install & launch
@@ -97,7 +107,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 case "${1:-}" in
-    ios|android) PLATFORM="$1"; shift ;;
+    ios|android|ohos) PLATFORM="$1"; shift ;;
     -h|--help)   usage; exit 0 ;;
     *)           error "Unknown subcommand: $1"; usage; exit 1 ;;
 esac
@@ -535,12 +545,195 @@ _android_install_and_launch() {
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+# HarmonyOS / OpenHarmony
+# ═════════════════════════════════════════════════════════════════════════════
+
+build_ohos() {
+    step "HarmonyOS — ${PROFILE} — ${TARGET_KIND}"
+
+    # 目标三元组跟着设备报的 ABI 走，不写死 aarch64：x86_64 宿主上那台 HarmonyOS
+    # 模拟器 `const.product.cpu.abilist` 就是 `x86_64`，喂它 arm64 的 .so 装得上、
+    # 起不来。没接设备时（比如只要出个包）退回 arm64-v8a。
+    local rust_target="" abi=""
+    if command -v hdc &>/dev/null; then
+        abi=$(hdc shell "param get const.product.cpu.abilist" 2>/dev/null \
+              | tr -d '\r' | cut -d, -f1 | tr 'A-Z' 'a-z')
+    fi
+    case "$abi" in
+        aarch64|arm64*) rust_target="aarch64-unknown-linux-ohos"; abi="arm64-v8a" ;;
+        x86_64)         rust_target="x86_64-unknown-linux-ohos";  abi="x86_64" ;;
+        *)              rust_target="aarch64-unknown-linux-ohos"; abi="arm64-v8a" ;;
+    esac
+    # sysroot 里那个库目录的写法与 rustc 的三元组不是一套（`aarch64-linux-ohos` /
+    # `x86_64-linux-ohos`），而 CC_/CFLAGS_ 那两个环境变量按 rustc 三元组命名。
+    local ohos_triple="${rust_target/-unknown-/}"
+    local var=${rust_target//[-.]/_}
+    info "Target: $rust_target  →  entry/libs/$abi"
+
+    # ── Rust toolchain ───────────────────────────────────────────────────
+    # OHOS is a Tier-3 target: std has to be built from source with nightly.
+    if ! rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+        error "Nightly Rust is required to build std for ${rust_target}."
+        error "Install it with: rustup toolchain install nightly --component rust-src"
+        exit 1
+    fi
+    rustup component add rust-src --toolchain nightly 2>/dev/null || true
+
+    # ── Locate the OpenHarmony SDK (native NDK + sysroot) ────────────────
+    local ohos_native="${OHOS_NDK:-}"
+    if [[ -z "$ohos_native" ]]; then
+        # Try a few common DevEco Studio locations.
+        for candidate in \
+            "$HOME/Library/OpenHarmony/Sdk"/*/native \
+            "$HOME/OpenHarmony/Sdk"/*/native \
+            "/Applications/DevEco-Studio.app/Contents/sdk"/*/openharmony/native \
+            "$HOME/.ohos/sdk"/*/native \
+            "$HOME/.local/share/harmonyos/command-line-tools/sdk/default/openharmony/native"; do
+            if [[ -d "$candidate" ]]; then
+                ohos_native="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$ohos_native" || ! -d "$ohos_native" ]]; then
+        error "OpenHarmony NDK (native sysroot) not found."
+        error "Set OHOS_NDK to your SDK's 'native' directory, e.g.:"
+        error "  export OHOS_NDK=\$HOME/OpenHarmony/Sdk/12/native"
+        error "The sysroot is needed to LINK the shared library."
+        error "Type-checking without an SDK is possible via:"
+        error "  cargo +nightly check --target ${rust_target} -Z build-std=std,panic_abort"
+        exit 1
+    fi
+    info "Using OpenHarmony NDK at: $ohos_native"
+
+    local cargo_profile_flag=""
+    local cargo_profile_dir="debug"
+    if [[ "$PROFILE" == "release" ]]; then
+        cargo_profile_flag="--release"
+        cargo_profile_dir="release"
+    fi
+
+    # ── Clean (optional) ─────────────────────────────────────────────────
+    if $CLEAN; then
+        info "Cleaning Rust build artifacts..."
+        cd "$EXAMPLES_DIR"
+        cargo clean --target "$rust_target" 2>/dev/null || true
+        rm -rf "$OHOS_DIR/entry/build" "$OHOS_DIR/build" 2>/dev/null || true
+    fi
+
+    # ── Build the Rust cdylib ────────────────────────────────────────────
+    step "Building Rust shared library for ${abi} (${PROFILE})"
+
+    cd "$EXAMPLES_DIR"
+    # `-Z build-std` builds the OHOS std from source (nightly only).
+    # The OHOS NDK clang is used both to link and (via CC_*) to assemble the
+    # `psm` stubs pulled in by gpui — those are per-arch, hence the derived
+    # `CC_${var}` / `CFLAGS_${var}` names rather than hardcoded aarch64 ones.
+    env \
+        OHOS_NDK="$ohos_native" \
+        "CC_${var}=$ohos_native/llvm/bin/clang" \
+        "CFLAGS_${var}=--target=${ohos_triple} --sysroot=$ohos_native/sysroot" \
+        "AR_${var}=$ohos_native/llvm/bin/llvm-ar" \
+        RUSTFLAGS="-Clinker=$ohos_native/llvm/bin/clang -Clink-arg=--target=${ohos_triple} -Clink-arg=--sysroot=$ohos_native/sysroot -Lnative=$ohos_native/sysroot/usr/lib/${ohos_triple}" \
+        cargo +nightly build \
+        --target "$rust_target" \
+        -Z build-std=std,panic_abort \
+        $cargo_profile_flag \
+        2>&1
+
+    local so_src="$EXAMPLES_DIR/target/${rust_target}/${cargo_profile_dir}/libgpui_mobile_example.so"
+    if [[ ! -f "$so_src" ]]; then
+        error "Shared library not found at: $so_src"
+        exit 1
+    fi
+
+    local libs_dir="$OHOS_DIR/entry/libs/${abi}"
+    mkdir -p "$libs_dir"
+    cp "$so_src" "$libs_dir/libgpui_mobile_example.so"
+    info "Shared library: $libs_dir/libgpui_mobile_example.so ($(du -h "$so_src" | cut -f1))"
+
+    # ── Assemble the HAP ─────────────────────────────────────────────────
+    step "Assembling HAP via hvigor"
+
+    cd "$OHOS_DIR"
+    local hvigor="hvigorw"
+    if [[ -x "$OHOS_DIR/hvigorw" ]]; then
+        hvigor="$OHOS_DIR/hvigorw"
+    elif ! command -v hvigorw &>/dev/null; then
+        error "hvigorw not found. Open the project once in DevEco Studio, or add"
+        error "the hvigor wrapper to \$PATH."
+        exit 1
+    fi
+
+    local build_mode="debug"
+    [[ "$PROFILE" == "release" ]] && build_mode="release"
+
+    "$hvigor" --mode module \
+        -p product=default \
+        -p buildMode="$build_mode" \
+        assembleHap 2>&1 | tail -30
+
+    local hap
+    hap=$(find "$OHOS_DIR/entry/build" -name '*.hap' 2>/dev/null | head -1)
+    if [[ -z "$hap" ]]; then
+        error "HAP not found under $OHOS_DIR/entry/build"
+        exit 1
+    fi
+    info "HAP: $hap ($(du -h "$hap" | cut -f1))"
+
+    # ── Install & launch ─────────────────────────────────────────────────
+    if $NO_RUN; then
+        info "Skipping install & launch (--no-run)."
+        return 0
+    fi
+
+    _ohos_install_and_launch "$hap"
+}
+
+_ohos_install_and_launch() {
+    local hap_path="$1"
+
+    step "Installing & launching on HarmonyOS"
+
+    if ! command -v hdc &>/dev/null; then
+        local hdc_candidate="${OHOS_NDK:-}/../../toolchains/hdc"
+        if [[ -x "$hdc_candidate" ]]; then
+            export PATH="$(dirname "$hdc_candidate"):$PATH"
+        else
+            error "hdc not found. Add the OpenHarmony toolchains directory to PATH."
+            info "HAP is at: $hap_path"
+            exit 1
+        fi
+    fi
+
+    local device_count
+    device_count=$(hdc list targets 2>/dev/null | grep -cvE '^\[Empty\]|^\s*$') || true
+    if [[ "${device_count:-0}" -eq 0 && "$TARGET_KIND" != "emulator" ]]; then
+        error "No connected HarmonyOS device found."
+        info "HAP is at: $hap_path"
+        exit 1
+    fi
+
+    info "Installing HAP..."
+    hdc install -r "$hap_path" 2>&1 || true
+
+    info "Launching app..."
+    hdc shell aa start -a EntryAbility -b dev.gpui.mobile.example 2>&1 || true
+
+    info "App launched on HarmonyOS! 🚀"
+    echo ""
+    info "View logs with:  hdc shell hilog -x | grep gpui-ohos"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Main dispatch
 # ═════════════════════════════════════════════════════════════════════════════
 
 case "$PLATFORM" in
     ios)     build_ios     ;;
     android) build_android ;;
+    ohos)    build_ohos    ;;
 esac
 
 echo ""

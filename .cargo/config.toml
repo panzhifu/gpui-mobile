@@ -9,6 +9,25 @@
 # when cross-compiling for Android (fontconfig is not available).
 RUST_FONTCONFIG_DLOPEN = "on"
 
+# ── HarmonyOS / OpenHarmony cross-assembler ──────────────────────────────────
+#
+# The `psm` crate (pulled in transitively via gpui → stacksafe → stacker)
+# assembles a small piece of arch-specific assembly with `cc`. When no
+# OpenHarmony SDK is installed we can still type-check the crate
+# (`cargo check`) by pointing `cc-rs` at the host `clang`, which is a
+# cross-assembler for both OHOS triples out of the box. A real device build
+# with the OHOS NDK should set these to the NDK clang instead (environment
+# variables take precedence, because cargo's `[env]` entries are non-forcing
+# by default).
+#
+# 两个三元组都要列：x86_64-unknown-linux-ohos 不是可选的装饰 —— x86_64 宿主上那台
+# HarmonyOS 模拟器报的 `const.product.cpu.abilist` 就是 `x86_64`，只给它 aarch64
+# 的产物等于装得上、起不来。
+CC_aarch64_unknown_linux_ohos = "clang"
+CFLAGS_aarch64_unknown_linux_ohos = "--target=aarch64-linux-ohos"
+CC_x86_64_unknown_linux_ohos = "clang"
+CFLAGS_x86_64_unknown_linux_ohos = "--target=x86_64-linux-ohos"
+
 # ── Android NDK linker configuration ─────────────────────────────────────────
 #
 # These use the NDK clang as the linker for each Android target.
@@ -28,3 +47,25 @@ RUST_FONTCONFIG_DLOPEN = "on"
 
 # [target.i686-linux-android]
 # linker = "/Users/pandranki/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/i686-linux-android26-clang"
+
+# ── HarmonyOS / OpenHarmony linker configuration ─────────────────────────────
+#
+# The Rust OHOS targets are Tier 3. Build std from source with nightly:
+#
+#   cargo +nightly build \
+#     --target aarch64-unknown-linux-ohos \
+#     -Z build-std=std,panic_abort
+#
+# To produce a real shared library you need the OpenHarmony SDK (native
+# NDK + sysroot). Uncomment the block below and point OHOS_NDK at your SDK's
+# `native` directory (e.g. .../Sdk/<ver>/openharmony/native or
+# .../HarmonyOS-NEXT-<ver>/base/native). `cargo build` also honours the
+# OHOS_NDK environment variable, so CI can set it instead of editing this file.
+#
+# [target.aarch64-unknown-linux-ohos]
+# linker = "clang"
+# rustflags = [
+#   "-Clink-arg=--target=aarch64-linux-ohos",
+#   "-Clink-arg=--sysroot=<OHOS_NDK>/sysroot",
+#   "-L", "native=<OHOS_NDK>/sysroot/usr/lib/aarch64-linux-ohos",
+# ]

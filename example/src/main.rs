@@ -33,7 +33,18 @@ fn main() {
     eprintln!("This binary is not used on Android. The app enters via android_main() in lib.rs.");
 }
 
-#[cfg(not(any(target_os = "ios", target_os = "android")))]
+#[cfg(target_env = "ohos")]
+fn main() {
+    // On HarmonyOS the app is a NAPI module (cdylib) loaded by the ArkTS
+    // `XComponent`; there is no binary entry point.  This target is unused but
+    // must compile.
+    eprintln!(
+        "This binary is not used on HarmonyOS. The app enters via the NAPI module \
+         registered in lib.rs (gpui_ohos_napi_module!)."
+    );
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
 fn main() {
     // Allow `cargo check` / `cargo clippy` on the host (macOS / Linux) to
     // succeed without requiring a mobile target.

@@ -62,13 +62,13 @@ extern crate gpui_mobile;
 pub mod demos;
 pub mod screens;
 
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(target_os = "ios", target_os = "android", target_env = "ohos"))]
 use gpui::{prelude::*, App, WindowOptions};
 
 #[cfg(target_os = "android")]
 use gpui::Application;
 
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(target_os = "ios", target_os = "android", target_env = "ohos"))]
 use screens::Router;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -217,6 +217,39 @@ pub fn ios_main() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// HarmonyOS (OpenHarmony) entry point
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Native module init called by the OHOS NAPI runtime when the ArkTS
+/// `XComponent` (with `libraryname: 'gpui_mobile_example'`) loads our `.so`.
+///
+/// It installs the GPUI platform, registers the JS-facing exports, and starts
+/// the (non-blocking) GPUI application.  The root view is opened later, once
+/// `OnSurfaceCreated` delivers the native window.
+#[cfg(target_env = "ohos")]
+pub extern "C" fn ohos_napi_init(
+    env: gpui_mobile::ohos::napi::NapiEnv,
+    exports: gpui_mobile::ohos::napi::NapiValue,
+) -> gpui_mobile::ohos::napi::NapiValue {
+    // SAFETY: `env` / `exports` come straight from the NAPI runtime.
+    unsafe {
+        gpui_mobile::ohos::napi::install(
+            env,
+            exports,
+            "gpui_mobile_example",
+            Box::new(|cx: &mut App| open_main_window(cx)),
+        );
+    }
+    exports
+}
+
+// Register the shared-library constructor that hands our `NapiModule` to the
+// OHOS runtime.  The module name must match the `XComponent` `libraryname`
+// (i.e. the `libgpui_mobile_example.so` produced by this crate).
+#[cfg(target_env = "ohos")]
+gpui_mobile::gpui_ohos_napi_module!("gpui_mobile_example", crate::ohos_napi_init);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Shared window creation
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -227,7 +260,7 @@ pub fn ios_main() {
 ///
 /// If the app was launched via a deeplink (e.g. `gpui://video_player`),
 /// the router starts on the corresponding screen.
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(any(target_os = "ios", target_os = "android", target_env = "ohos"))]
 fn open_main_window(cx: &mut App) {
     gpui_kit::init(cx);
     gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
@@ -236,15 +269,24 @@ fn open_main_window(cx: &mut App) {
     // On iOS, rustls-native-certs fails to load system root certs, causing all
     // HTTPS requests to fail with "UnknownIssuer". Since this is a demo app,
     // disabling cert verification is acceptable.
-    log::info!("Setting up HTTP client for image loading...");
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .expect("Failed to create reqwest client");
-    let http_client: reqwest_client::ReqwestClient = client.into();
-    cx.set_http_client(std::sync::Arc::new(http_client));
-    log::info!("HTTP client configured successfully");
+    // 远程图片要的 HTTP 出口只挂在 iOS / Android：rustls 在 OHOS 上没有现成的后端，
+    // 那条线上也没有 `cx.set_http_client` 这个口，所以远端图先不接。
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        log::info!("Setting up HTTP client for image loading...");
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to create reqwest client");
+        let http_client: reqwest_client::ReqwestClient = client.into();
+        cx.set_http_client(std::sync::Arc::new(http_client));
+        log::info!("HTTP client configured successfully");
+    }
+    #[cfg(target_env = "ohos")]
+    {
+        log::warn!("HTTP client not configured on HarmonyOS — remote images disabled");
+    }
     screens::markdown::init(cx);
 
     // Check if the app was launched via a deeplink and determine the initial screen.
