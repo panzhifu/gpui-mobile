@@ -251,6 +251,36 @@ pub fn try_platform() -> Option<Arc<OhosPlatform>> {
 
 const XCOMPONENT_OBJ: &CStr = c"__NATIVE_XCOMPONENT_OBJ__";
 
+/// A hook on the `Application` builder, applied the one time the app starts.
+type Configure = Box<dyn FnOnce(Application) -> Application + Send>;
+
+/// Set by [`install_with_assets`], consumed when the app is built.
+static CONFIGURE: Mutex<Option<Configure>> = Mutex::new(None);
+
+/// Like [`install`], but registers an [`gpui::AssetSource`] on the `Application`
+/// before it starts.
+///
+/// Same reason as Android's `start_with_assets`: `with_assets` consumes the builder,
+/// and a host whose only entry point is the `&mut App` in the launch closure has no
+/// way to reach it. Without an asset source everything resolved by path — gpui-kit's
+/// Lucide icons, any `svg().path("icons/…")` — comes back empty, and it comes back
+/// empty *silently*: a blank icon, not an error.
+///
+/// # Safety
+/// Same contract as [`install`].
+pub unsafe fn install_with_assets<A>(
+    env: NapiEnv,
+    exports: NapiValue,
+    module_name: &'static str,
+    assets: A,
+    app_cb: Box<dyn FnOnce(&mut App) + Send>,
+) where
+    A: gpui::AssetSource,
+{
+    *CONFIGURE.lock() = Some(Box::new(move |application| application.with_assets(assets)));
+    install(env, exports, module_name, app_cb);
+}
+
 /// Initialise the OHOS platform and register the NAPI exports.
 ///
 /// Called from the consumer crate's NAPI init function.  `app_cb` is the
@@ -314,7 +344,14 @@ pub unsafe fn install(
 
     if APP_HANDLE.load(Ordering::Acquire).is_null() {
         let run_platform = SharedPlatform::new(platform.clone()).into_rc();
-        let handle = Application::with_platform(run_platform).run_embedded(|cx: &mut App| {
+        let application = Application::with_platform(run_platform);
+        // The asset source has to go on the builder before `run_embedded` consumes
+        // it. Taken here, so a second module-init pass can't apply it twice.
+        let application = match CONFIGURE.lock().take() {
+            Some(configure) => configure(application),
+            None => application,
+        };
+        let handle = application.run_embedded(|cx: &mut App| {
             if let Some(cb) = APP_CB.lock().take() {
                 log::info!("napi: invoking app callback");
                 cb(cx);
