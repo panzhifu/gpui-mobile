@@ -3,10 +3,15 @@
   platform layer (rendering, touch input, lifecycle) is implemented and runs a live
   frame loop on the emulator.
 - HarmonyOS: validate the backend on a **physical device**. The x86_64 emulator is
-  validated (links, installs, lays out and renders a scene every frame) but cannot
-  show pixels: its GLES is Mesa reporting 3.0, with no SSBOs for gpui_wgpu's
-  instance data. Also wire the software keyboard through `@ohos.inputMethod`
-  (currently best-effort).
+  validated end to end — links, installs, draws (instance data goes through the
+  texture transport because that driver has no SSBOs) — but a phone is a different
+  GLES stack, and nobody has run it there.
+- HarmonyOS: ship a bundled emoji font the way Android does. The system's
+  `HMOSColorEmojiCompat.ttf` cannot be added to the font database: GPUI then
+  resolves emoji by that family name and the face has no style it asks for, so the
+  first text render panics.
+- HarmonyOS: wire the software keyboard through `@ohos.inputMethod` (currently
+  best-effort — the request is logged, not delivered).
 - Improve the UX of the APIs exposed by the library.
 - Assitive technologies support (e.g., screen readers, voice control).
 - Deeplinking?

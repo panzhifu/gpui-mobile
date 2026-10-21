@@ -150,7 +150,7 @@ hdc install -r entry/build/default/outputs/default/entry-default-unsigned.hap
 | Android (arm64) | ✅ | API 26+ | Vulkan (preferred), GL ES 3.0 |
 | Android (armv7/x86_64) | ⚠️ Untested | API 26+ | Vulkan / GL ES |
 | HarmonyOS / OpenHarmony (arm64) | ⚠️ 未上真机 | API 12+ | OpenGL ES (EGL) |
-| HarmonyOS emulator (x86_64) | ⚠️ 起得来、画不出 | API 26 | OpenGL ES (EGL) — 见下文那台驱动的 SSBO |
+| HarmonyOS emulator (x86_64) | ✅ 画得出来 | API 26 | OpenGL ES (EGL) — 那台驱动的 SSBO 缺口见下文 |
 
 ### HarmonyOS / OpenHarmony
 
@@ -190,26 +190,39 @@ The `ohos` backend mirrors the Android one. Key points:
 > and renders a scene (`Router: render() screen=Home`, then 20 quads and 199
 > monochrome sprites per frame). Nothing aborts; the app sits there drawing.
 >
-> What it cannot do is bind that scene. The driver reports
+> That scene initially could not be bound. The driver reports
 > `storage_buffers_per_stage = 0` and `max_storage_buffer_binding_size = 0`, and
 > lacks `DownlevelFlags::VERTEX_STORAGE` — GLES 3.0 has no SSBOs, and gpui_wgpu
-> keeps its instance data in a storage buffer. Per frame the renderer then says
-> `PipelineLayout with 'poly_sprites_layout' label is invalid` and
+> keeps its instance data in a storage buffer, so every frame said
 > `scene too large: … instance data needs 3200 bytes, above the maximum of 0`.
-> **So: no pixels on that emulator, for a driver reason, not a code reason.** A
-> physical HarmonyOS phone (GLES 3.2) has not been tested here.
+> gpui_wgpu already had a second transport for exactly this (instance data in an
+> integer texture, written for WebGL2); it was gated on `target_family = "wasm"`
+> *and* on `WgpuBackend::Gl`, which is the wasm variant — a native GLES adapter
+> arrives as `Native(Backend::Gl)` — so no native device could reach it. Selecting
+> it by adapter capability instead (in `panzhifu/gpui-folio`) is what put pixels on
+> this emulator. A physical HarmonyOS phone (GLES 3.2) is still untested here.
 >
-> Four things that looked like bugs during that investigation, all now fixed:
+> Five things that looked like bugs during that investigation, all now fixed:
 > `hilog`'s `LogType` is `LOG_APP = 0` in the current SDK (the old `1 = APP`
 > numbering silently drops every native log line); the OHOS system libraries
 > must be linked explicitly, which now lives in the `#[link]` attributes in
 > `src/ohos/mod.rs` rather than in each downstream's build script; a frame must
-> not run on the vsync thread (see above); and the app has to be started with
+> not run on the vsync thread (see above); the app has to be started with
 > `Application::run_embedded` with the returned `ApplicationHandle` kept alive —
 > `Platform::run` returns immediately here, so dropping that handle releases the
 > `App`, and the runtime calls the module init a *second* time when it binds the
 > XComponent, so a second `run` also overwrites the launch callback the first one
-> is waiting on. Both show up as `app was released` sixty times a second.
+> is waiting on, and both show up as `app was released` sixty times a second; and
+> the font probe list has to name the files this image actually ships
+> (`HarmonyOS_Sans_SC.ttf`, not `HarmonyOS_Sans_SC_Regular.ttf`) — otherwise Latin
+> still renders from whichever face matched and every CJK glyph comes out as a
+> `.notdef` box, which is silent. `HMOSColorEmojiCompat.ttf` is deliberately *not*
+> on the list: once it is in the font database GPUI resolves emoji by its family
+> name, that face has no style GPUI asks for, and the first text render panics.
+> Emoji ships bundled, as on Android.
+>
+> The software keyboard is best-effort (driven from ArkTS via
+> `@ohos.inputMethod`); hardware key events already work.
 >
 > The software keyboard is best-effort (driven from ArkTS via
 > `@ohos.inputMethod`); hardware key events already work.
