@@ -46,3 +46,21 @@ panic = "abort"
 [profile.dev]
 opt-level = 0
 debug = true
+
+# 这一格此前是空的，而它并不多余：`example/` 是一个独立 workspace（它有自己的
+# `Cargo.lock`），cargo 只认工作区根上的 `[patch]` —— 仓库根那几条对这里**不生效**，
+# gpui-mobile 又是以 path 依赖进来的。于是 example 一直在编 crates.io 那份 0.3.9，
+# 缺 fork 里的 limits 修复：鸿蒙上 `request_device` 逐条校验失败（`Limit
+# 'max_compute_workgroups_per_dimension' value 65535 is better than allowed 0`），
+# 日志说的是「没有可用 GPU」，而那其实只是驱动没有 compute。
+#
+# 两条一起换、同一个 rev：fork 的渲染器用的是 fork 的 `gpui-pre`，分开换就是两棵
+# gpui 的 `Window` / `Scene`。
+#
+# 第三条 `gpui-pre-platform` 才是鸿蒙链得出 cdylib 的那一格：门面按 `target_os` 选
+# 平台，鸿蒙报 `target_os = "linux"`，于是桌面 `gpui-pre-linux` 的
+# `-lxcb -lxkbcommon -lxkbcommon-x11` 进了链接行，而 OHOS 的 sysroot 里没有这些库。
+[patch.crates-io]
+gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
+gpui-pre-platform = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }

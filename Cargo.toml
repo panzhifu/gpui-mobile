@@ -180,8 +180,27 @@ debug     = true
 # vendor 与 `panzhifu/gpui-pre-wgpu@617a933` 逐文件相同（只差一个 `.gitignore`），
 # 而 cargo 的 git 源只读仓库根那份 manifest、指不到别人仓库的子目录 —— 所以那份快照
 # 早就抽成了独立仓库。既然它已经在那儿了，就直接指它，不必在树里再养一份副本：
-# 副本不会自己更新，而每一次「把 vendor 同步回上游」都是一次会漏的手工活。
+# 副本不会自己更新，而每一次「把 vendor 同步回上游」是一次会漏的手工活。
 #
-# 钉 rev 不跟分支：这条依赖同时换掉桌面的渲染器，飘一个 commit 就是换一套像素。
+# 现在改指 `panzhifu/gpui-folio`：那条独立仓库停在 617a933，缺了 fork 里
+# `wgpu_context.rs` 那一格 limits 修复（`request_device` 直接采用适配器报的那份，
+# 而不是 `downlevel_defaults()` 漏下的一整套高值）。鸿蒙模拟器实测两边不是一回事：
+# 用 617a933 时 `request_device` 逐条校验失败（`Limit 'max_compute_workgroups_per_dimension'
+# value 65535 is better than allowed 0`），一个 adapter 都留不下，日志说的是「没有可用
+# GPU」；用 fork 时设备建成、`vsync frame loop started`。同一块驱动，两种死法。
+#
+# `gpui-pre` 必须跟着一起换：fork 的渲染器用的是 fork 的 `gpui-pre`（页卷曲那套 Mesh
+# primitive 与片元里的受光），两棵 gpui 的 `Window` / `Scene` 类型对不上。
+#
+# 钉 rev 不跟分支：这几条同时换掉桌面的渲染器与那层 platform 门面，飘一个 commit
+# 就是换一套像素。
+#
+# 第三条 `gpui-pre-platform` 是让鸿蒙链得出 cdylib 的那一格：门面按 `target_os` 选
+# 平台，而鸿蒙的三元组报 `target_os = "linux"`，于是桌面 `gpui-pre-linux` 的
+# `-lxcb -lxkbcommon -lxkbcommon-x11` 进了链接行，OHOS 的 sysroot 里没有这些库 ——
+# 编译全过、只有真链才撞，`cargo check` 一路绿灯。判据在那棵树里收紧成
+# `all(target_os = "linux", not(target_env = "ohos"))`。
 [patch.crates-io]
-gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-pre-wgpu", rev = "617a93340cd282e859a75e6fc710f735b8c17b6c" }
+gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
+gpui-pre-platform = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
