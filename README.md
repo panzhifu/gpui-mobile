@@ -221,16 +221,18 @@ once the last offscreen window closes, the render target sized to the last
 frame and the glyph and image tiles the offscreen windows uploaded are released.
 
 It needs `gpui-pre-wgpu`'s headless renderer, which upstream only builds for
-tests and benchmarks and which picks a Vulkan/GL device that iOS lacks. This
-repository vendors `gpui-pre-wgpu` 0.3.8 with that renderer behind an
-`offscreen` feature, a constructor that takes the wgpu instance, and methods
-that release its render target and clear its sprite atlas
-(`vendor/gpui-pre-wgpu`). An application enabling `offscreen` must patch it the
-same way:
+tests and benchmarks and which picks a Vulkan/GL device that iOS lacks. That
+patched renderer lives in its own repository —
+[`panzhifu/gpui-pre-wgpu`](https://github.com/panzhifu/gpui-pre-wgpu), 0.3.9,
+with the renderer behind an `offscreen` feature, a constructor that takes the
+wgpu instance, and methods that release its render target and clear its sprite
+atlas. This repository patches to it; an application enabling `offscreen` must
+patch the same way (cargo only reads a git source's root manifest, so pointing
+at a subdirectory of another repo is not an option):
 
 ```toml
 [patch.crates-io]
-gpui-pre-wgpu = { git = "https://github.com/longbridge/gpui-mobile" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-pre-wgpu", rev = "617a93340cd282e859a75e6fc710f735b8c17b6c" }
 ```
 
 ## Screenshots

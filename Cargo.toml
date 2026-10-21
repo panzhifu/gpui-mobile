@@ -48,7 +48,7 @@ calendar = []
 deeplink = []
 microphone = []
 media_session = []
-# Render GPUI windows into images (`gpui_mobile::offscreen`). Needs the vendored
+# Render GPUI windows into images (`gpui_mobile::offscreen`). Needs the patched
 # `gpui-pre-wgpu` (see `[patch.crates-io]`), which exposes its headless renderer.
 offscreen = ["gpui_wgpu/offscreen", "dep:image"]
 
@@ -170,10 +170,18 @@ strip         = true
 opt-level = 0
 debug     = true
 
-# `gpui-pre-wgpu` 0.3.8 with its headless renderer behind an `offscreen` feature
+# `gpui-pre-wgpu` 0.3.9 with its headless renderer behind an `offscreen` feature
 # instead of `test-support` / `bench-support`, a constructor that takes the wgpu
 # instance (iOS needs Metal), and methods that release its render target and
 # clear its sprite atlas between captures. Applications that enable `offscreen`
 # must patch it the same way.
+#
+# 从前这里是一条 `path = "vendor/gpui-pre-wgpu"`，把整个 crate 抄在本仓库里。那份
+# vendor 与 `panzhifu/gpui-pre-wgpu@617a933` 逐文件相同（只差一个 `.gitignore`），
+# 而 cargo 的 git 源只读仓库根那份 manifest、指不到别人仓库的子目录 —— 所以那份快照
+# 早就抽成了独立仓库。既然它已经在那儿了，就直接指它，不必在树里再养一份副本：
+# 副本不会自己更新，而每一次「把 vendor 同步回上游」都是一次会漏的手工活。
+#
+# 钉 rev 不跟分支：这条依赖同时换掉桌面的渲染器，飘一个 commit 就是换一套像素。
 [patch.crates-io]
-gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-pre-wgpu", rev = "617a93340cd282e859a75e6fc710f735b8c17b6c" }
