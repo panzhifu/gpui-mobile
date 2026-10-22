@@ -990,6 +990,14 @@ impl PlatformWindow for OhosPlatformWindow {
         true
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // GPUI calls this when the window turns dirty; the vsync loop draws at the
+        // next callback (`vsync.rs`). Without it there is no demand to arm on, and
+        // an idle-but-armed loop is what wedges the main thread in
+        // `eglSwapBuffers` once another window covers this one.
+        Some(Rc::new(super::vsync::schedule))
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         // PlatformWindow gives Box<dyn FnMut(..)> (not Send); the callback is
         // always invoked on the OHOS main thread, so the transmute is safe.
@@ -1399,6 +1407,13 @@ impl PlatformWindow for OhosPlatformWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         self.window.draw(scene);
+    }
+
+    fn schedule_frame(&self) {
+        // GPUI's own retry path: a frame that ended with the window still dirty
+        // (an animation, a fling) or with next-frame callbacks pending raises
+        // demand here instead of assuming the platform ticks regardless.
+        super::vsync::schedule();
     }
 
     // gpui-pre 0.3.9 的 `PlatformWindow` 没有 `completed_frame` 这一格（Android 臂

@@ -468,13 +468,18 @@ impl xcomponent::XComponentHandler for GpuiXComponentHandler {
                     // Install the dispatcher waker and start the vsync loop.
                     platform
                         .dispatcher()
-                        .set_main_thread_waker(|| vsync::request_frame());
+                        .set_main_thread_waker(|| vsync::schedule());
 
                     let p = platform.clone();
                     vsync::start(Box::new(move || {
+                        // The tick runs every frame: it drains GPUI's foreground
+                        // queue, and a task it runs is often what raises the
+                        // demand the check below reads.
                         p.tick();
-                        if let Some(win) = p.primary_window() {
-                            win.request_frame();
+                        if vsync::take_demand() {
+                            if let Some(win) = p.primary_window() {
+                                win.request_frame();
+                            }
                         }
                     }));
                 }
