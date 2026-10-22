@@ -163,6 +163,7 @@ pub fn size<T>(width: T, height: T) -> Size<T> {
 
 pub mod dispatcher;
 pub mod display;
+pub mod file_picker;
 pub mod keyboard;
 pub mod logging;
 pub mod main_thread;

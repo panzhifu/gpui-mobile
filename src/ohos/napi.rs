@@ -107,6 +107,15 @@ extern "C" {
     ) -> NapiStatus;
     fn napi_unwrap(env: NapiEnv, js_object: NapiValue, result: *mut *mut c_void) -> NapiStatus;
     fn napi_get_value_double(env: NapiEnv, value: NapiValue, result: *mut c_double) -> NapiStatus;
+    fn napi_create_double(env: NapiEnv, value: c_double, result: *mut NapiValue) -> NapiStatus;
+    /// Two-call: `buf = null, bufsize = 0` reads the length into `result`.
+    fn napi_get_value_string_utf8(
+        env: NapiEnv,
+        value: NapiValue,
+        buf: *mut c_char,
+        bufsize: usize,
+        result: *mut usize,
+    ) -> NapiStatus;
     fn napi_get_undefined(env: NapiEnv, result: *mut NapiValue) -> NapiStatus;
     fn napi_create_string_utf8(
         env: NapiEnv,
@@ -137,7 +146,13 @@ extern "C" {
 }
 
 /// `napi_valuetype::napi_function`.
-const NAPI_FUNCTION: c_int = 6;
+///
+/// `js_native_api_types.h` enumerates `undefined=0, null, boolean, number, string,
+/// symbol, object, function` — so **7**, not 6. With 6 every JS function argument
+/// compared equal to `napi_object` instead, and both bridges that take a function
+/// (`nativeSetKeyboardCallback`, `nativeSetFolderPicker`) rejected their caller with
+/// "argument is not a function" while ArkTS was passing a perfectly good closure.
+const NAPI_FUNCTION: c_int = 7;
 
 // ── NapiModule ────────────────────────────────────────────────────────────────
 
@@ -230,6 +245,9 @@ static APP_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 static NAPI_ENV: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static KEYBOARD_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The ArkTS function registered by `nativeSetFolderPicker`.
+static PICKER_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Returns the global platform singleton.
 ///
@@ -325,6 +343,14 @@ pub unsafe fn install(
         c"nativeSetKeyboardCallback",
         native_set_keyboard_callback,
     );
+    register_function(
+        env,
+        exports,
+        c"nativeSetFolderPicker",
+        native_set_folder_picker,
+    );
+    register_function(env, exports, c"nativeDeliverPick", native_deliver_pick);
+    register_function(env, exports, c"nativeFailPick", native_fail_pick);
 
     // 2. Create the platform singleton and start the (non-blocking) GPUI app —
     //    exactly once, and keep the handle.
@@ -742,4 +768,134 @@ fn keyboard_type_name(k: crate::KeyboardType) -> &'static str {
         crate::KeyboardType::URL => "url",
         crate::KeyboardType::Decimal => "decimal",
     }
+}
+
+// ── file / folder picker ──────────────────────────────────────────────────────
+
+/// `nativeSetFolderPicker(fn)` — ArkTS registers `(requestId: number, mode: string) => void`
+/// and answers later with `nativeDeliverPick(requestId, paths)` or
+/// `nativeFailPick(requestId, reason)`.
+///
+/// The request/reply pair (instead of handing JS a callback to call) is what lets a
+/// second request arrive while one is still open, and lets the JS side be `async`.
+extern "C" fn native_set_folder_picker(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    ensure_main_thread_hop(env);
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let value = argv[0];
+    let mut ty: c_int = 0;
+    if unsafe { napi_typeof(env, value, &mut ty as *mut _) } != NAPI_OK || ty != NAPI_FUNCTION {
+        log::warn!("nativeSetFolderPicker: argument is not a function");
+        return undefined(env);
+    }
+
+    let mut reference: NapiRef = std::ptr::null_mut();
+    if unsafe { napi_create_reference(env, value, 1, &mut reference as *mut _) } != NAPI_OK {
+        log::warn!("nativeSetFolderPicker: napi_create_reference failed");
+        return undefined(env);
+    }
+    PICKER_REF.store(reference, Ordering::Release);
+
+    super::file_picker::set_prompt_handler(|id, mode| call_folder_picker(id, mode));
+    log::info!("napi: folder picker registered");
+    undefined(env)
+}
+
+/// Ask the ArkTS side to open a picker.
+///
+/// Calling into JS is only legal on the thread that owns the env — the UI thread.
+/// GPUI runs there (see [`super::main_thread`]), so the usual path is a direct call;
+/// anything else is hopped first rather than executed on the wrong thread.
+fn call_folder_picker(id: u64, mode: &str) {
+    let on_ui_thread = try_platform().is_none_or(|p| p.dispatcher().is_main_thread());
+    if !on_ui_thread {
+        let mode = mode.to_string();
+        return match super::main_thread::post(Box::new(move || call_folder_picker(id, &mode))) {
+            true => {}
+            false => super::file_picker::fail(id, "no UI-thread hop available yet"),
+        };
+    }
+
+    let env = NAPI_ENV.load(Ordering::Acquire);
+    let reference = PICKER_REF.load(Ordering::Acquire);
+    if env.is_null() || reference.is_null() {
+        super::file_picker::fail(id, "no picker registered");
+        return;
+    }
+
+    let mut func: NapiValue = std::ptr::null_mut();
+    if unsafe { napi_get_reference_value(env, reference, &mut func as *mut _) } != NAPI_OK
+        || func.is_null()
+    {
+        super::file_picker::fail(id, "the registered picker function is gone");
+        return;
+    }
+
+    let mut id_arg: NapiValue = std::ptr::null_mut();
+    unsafe { napi_create_double(env, id as c_double, &mut id_arg as *mut _) };
+    let mut mode_arg: NapiValue = std::ptr::null_mut();
+    let c_mode = std::ffi::CString::new(mode).unwrap_or_default();
+    unsafe { napi_create_string_utf8(env, c_mode.as_ptr(), mode.len(), &mut mode_arg as *mut _) };
+
+    let argv = [id_arg, mode_arg];
+    let mut result: NapiValue = std::ptr::null_mut();
+    let status =
+        unsafe { napi_call_function(env, undefined(env), func, 2, argv.as_ptr(), &mut result) };
+    if status != NAPI_OK {
+        log::warn!("napi_call_function(folderPicker) status={status}");
+        super::file_picker::fail(id, "calling the ArkTS picker failed");
+    }
+}
+
+/// `nativeDeliverPick(requestId, paths)` — picked real paths joined with
+/// [`super::file_picker::SEPARATOR`]; an empty string means the reader cancelled.
+extern "C" fn native_deliver_pick(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<2>(env, info);
+    if argc >= 2 {
+        if let (Some(id), Some(paths)) = (arg_f64(env, argv[0]), arg_string(env, argv[1])) {
+            super::file_picker::deliver(id as u64, &paths);
+        }
+    }
+    undefined(env)
+}
+
+/// `nativeFailPick(requestId, reason)` — the picker ran but produced nothing usable
+/// (a URI that is not a real path, or the picker itself failed).
+extern "C" fn native_fail_pick(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<2>(env, info);
+    if argc >= 2 {
+        if let (Some(id), Some(reason)) = (arg_f64(env, argv[0]), arg_string(env, argv[1])) {
+            super::file_picker::fail(id as u64, &reason);
+        }
+    }
+    undefined(env)
+}
+
+/// Read a JS string argument. Length first, then the bytes — `napi_get_value_string_utf8`
+/// writes at most `bufsize - 1` bytes and NUL-terminates, so the buffer is `len + 1`.
+fn arg_string(env: NapiEnv, value: NapiValue) -> Option<String> {
+    let mut len: usize = 0;
+    if unsafe { napi_get_value_string_utf8(env, value, std::ptr::null_mut(), 0, &mut len) }
+        != NAPI_OK
+    {
+        return None;
+    }
+    let mut buf = vec![0u8; len + 1];
+    let mut written: usize = 0;
+    if unsafe {
+        napi_get_value_string_utf8(
+            env,
+            value,
+            buf.as_mut_ptr() as *mut c_char,
+            len + 1,
+            &mut written,
+        )
+    } != NAPI_OK
+    {
+        return None;
+    }
+    buf.truncate(written);
+    String::from_utf8(buf).ok()
 }

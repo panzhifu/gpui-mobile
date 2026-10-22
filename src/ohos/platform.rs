@@ -709,13 +709,13 @@ impl Platform for OhosPlatform {
         Task::ready(Ok(()))
     }
 
+    /// Forward the request to the ArkTS picker (`@ohos.file.picker`). The NDK has no
+    /// picker of its own, so this cannot be answered here — see `ohos::file_picker`.
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
-        let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Ok(None));
-        rx
+        super::file_picker::prompt(options)
     }
 
     fn prompt_for_new_path(
