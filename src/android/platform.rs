@@ -35,7 +35,7 @@
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
-    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem, CursorStyle,
     ForegroundExecutor, GestureTuning, KeybindingKeystroke, Keymap, Keystroke, Menu, MenuItem,
     PathPromptOptions, Platform, PlatformDisplay, PlatformGestures, PlatformKeyboardLayout,
     PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, ScrollPhysics, Task, ThermalState,
@@ -178,6 +178,14 @@ struct AndroidPlatformState {
 
     /// Called when the keyboard layout changes.
     keyboard_layout_callback: Option<Box<dyn FnMut() + Send>>,
+
+    /// Mobile lifecycle phases. Registered through `Platform::on_app_lifecycle`;
+    /// invoked from the host command loop on the GPUI thread.
+    app_lifecycle_callback: Option<Box<dyn FnMut(AppLifecyclePhase) + Send>>,
+
+    /// Memory-pressure warnings. Registered through `Platform::on_memory_warning`;
+    /// invoked from the host command loop on the GPUI thread.
+    memory_warning_callback: Option<Box<dyn FnMut() + Send>>,
 
     /// Called once when `MainEvent::InitWindow` has successfully created the
     /// native window.  This is where the user should set up their GPUI views.
@@ -491,6 +499,8 @@ impl AndroidPlatform {
                 reopen_callback: None,
                 open_urls_callback: None,
                 keyboard_layout_callback: None,
+                app_lifecycle_callback: None,
+                memory_warning_callback: None,
                 on_init_window_callback: None,
                 is_active: false,
                 headless,
@@ -643,12 +653,34 @@ impl AndroidPlatform {
     pub fn did_become_active(&self) {
         log::debug!("AndroidPlatform::did_become_active");
         self.state.lock().is_active = true;
+        self.emit_app_lifecycle(AppLifecyclePhase::Active);
     }
 
     /// Called by the app delegate when the app moves to the background.
     pub fn did_enter_background(&self) {
         log::debug!("AndroidPlatform::did_enter_background");
         self.state.lock().is_active = false;
+        self.emit_app_lifecycle(AppLifecyclePhase::Background);
+    }
+
+    /// Fan one lifecycle phase out to the registered observer. The callback is
+    /// taken out of the lock while it runs so application code may reach the
+    /// platform without deadlocking (same shape as `try_quit_callback`).
+    fn emit_app_lifecycle(&self, phase: AppLifecyclePhase) {
+        let mut callback = self.state.lock().app_lifecycle_callback.take();
+        if let Some(callback) = callback.as_mut() {
+            callback(phase);
+        }
+        self.state.lock().app_lifecycle_callback = callback;
+    }
+
+    /// Called from the host command loop when the OS reports memory pressure.
+    pub fn notify_memory_warning(&self) {
+        let mut callback = self.state.lock().memory_warning_callback.take();
+        if let Some(callback) = callback.as_mut() {
+            callback();
+        }
+        self.state.lock().memory_warning_callback = callback;
     }
 
     /// Deliver URLs from an implicit or explicit intent.
@@ -1337,6 +1369,23 @@ impl Platform for AndroidPlatform {
         });
     }
 
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
+        // Same main-thread-only contract as `on_reopen`; the state's `Send`
+        // impl covers this box.
+        self.state.lock().app_lifecycle_callback = Some(unsafe {
+            std::mem::transmute::<
+                Box<dyn FnMut(AppLifecyclePhase)>,
+                Box<dyn FnMut(AppLifecyclePhase) + Send>,
+            >(callback)
+        });
+    }
+
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        self.state.lock().memory_warning_callback = Some(unsafe {
+            std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
+        });
+    }
+
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {
         // No-op: Android doesn't have macOS-style menus.
     }
@@ -1607,6 +1656,12 @@ impl Platform for SharedPlatform {
     }
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         <AndroidPlatform as Platform>::on_reopen(&self.0, callback)
+    }
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
+        <AndroidPlatform as Platform>::on_app_lifecycle(&self.0, callback)
+    }
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        <AndroidPlatform as Platform>::on_memory_warning(&self.0, callback)
     }
     fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
         <AndroidPlatform as Platform>::on_displays_changed(&self.0, callback)

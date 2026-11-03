@@ -1975,6 +1975,23 @@ pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeBackGestur
     super::frame_source::schedule_frame();
 }
 
+/// JNI bridge: the OS reported memory pressure (`Activity.onTrimMemory`).
+///
+/// Posts a command so the warning reaches the GPUI thread; the platform's
+/// registered `on_memory_warning` observer runs there.
+///
+/// # Safety
+/// Must only be called from the JVM on a valid JNI thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Java_dev_gpui_mobile_GpuiInputActivity_nativeTrimMemory(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    _level: i32,
+) {
+    super::host::post_memory_warning();
+    super::frame_source::schedule_frame();
+}
+
 // ── JNI export for GpuiActivity splash screen ────────────────────────────────
 
 /// Called from `GpuiActivity.nativeIsInitialized()` to check whether the

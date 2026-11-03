@@ -134,6 +134,9 @@ enum Command {
     ConfigurationChanged {
         ui_mode: i32,
     },
+    /// The OS reported memory pressure (`Activity.onTrimMemory`). Forwarded to
+    /// the platform's registered observer on the GPUI thread.
+    MemoryWarning,
     /// Input arrives on the Java UI thread but GPUI may only be touched from the
     /// render thread, so both go through the queue like everything else.
     Touch(TouchPoint),
@@ -422,6 +425,7 @@ fn render_thread(launch: Launch) {
                     // Stacked hosts' windows follow too.
                     platform.set_appearance(super::jni::appearance_from_ui_mode(ui_mode));
                 }
+                Command::MemoryWarning => platform.notify_memory_warning(),
                 Command::Paused { host } => {
                     platform.did_enter_background();
                     if let Some(win) = app.windows.get(&host) {
@@ -791,4 +795,10 @@ pub fn resumed(host: HostId) {
 
 pub fn paused(host: HostId) {
     post(Command::Paused { host });
+}
+
+/// Call from `Activity.onTrimMemory`. The level is advisory only; the platform
+/// forwards the warning without interpreting it.
+pub(crate) fn post_memory_warning() {
+    post(Command::MemoryWarning);
 }
