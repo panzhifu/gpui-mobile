@@ -68,7 +68,7 @@ raw-window-handle = "0.6"
 image        = { version = "0.25", default-features = false, optional = true }
 
 # ── GPUI core crate (provides Platform trait, event types, geometry, etc.) ───
-gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false }
+gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false }
 
 # ── iOS ──────────────────────────────────────────────────────────────────────
 
@@ -91,8 +91,8 @@ block2              = "0.6"
 libc = "=0.2.189"
 
 # wgpu renderer (Metal backend on iOS/Android)
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.9", features = ["font-kit"] }
-wgpu = "29.0.4"
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.11", features = ["font-kit"] }
+wgpu = "30.0.1"
 
 # Text / font stack
 pathfinder_geometry = "0.5"
@@ -122,7 +122,7 @@ android_logger = "0.15"
 
 # wgpu renderer (Vulkan backend on Android)
 # Android uses Cosmic Text and system fonts; font-kit pulls in desktop Fontconfig.
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.9" }
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.11" }
 
 # TalkBack: exposes GPUI's AccessKit tree (accesskit 0.24, as gpui-pre).
 accesskit_android = "0.7.5"
@@ -146,8 +146,8 @@ uuid       = { version = "1", features = ["v5"] }
 # 好与 gpui-pre-wgpu 里那份合成一棵。
 
 [target.'cfg(target_env = "ohos")'.dependencies]
-gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.9" }
-wgpu = "29.0.4"
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.11" }
+wgpu = "30.0.1"
 
 libc       = "0.2"
 rustc-hash = "2"
@@ -156,7 +156,7 @@ uuid       = { version = "1", features = ["v5"] }
 # ── dev ──────────────────────────────────────────────────────────────────────
 
 [dev-dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.9", default-features = false, features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false, features = ["test-support"] }
 
 # ── profiles ─────────────────────────────────────────────────────────────────
 
@@ -170,7 +170,7 @@ strip         = true
 opt-level = 0
 debug     = true
 
-# `gpui-pre-wgpu` 0.3.9 with its headless renderer behind an `offscreen` feature
+# `gpui-pre-wgpu` 0.3.11 with its headless renderer behind an `offscreen` feature
 # instead of `test-support` / `bench-support`, a constructor that takes the wgpu
 # instance (iOS needs Metal), and methods that release its render target and
 # clear its sprite atlas between captures. Applications that enable `offscreen`
@@ -201,6 +201,6 @@ debug     = true
 # 编译全过、只有真链才撞，`cargo check` 一路绿灯。判据在那棵树里收紧成
 # `all(target_os = "linux", not(target_env = "ohos"))`。
 [patch.crates-io]
-gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
-gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
-gpui-pre-platform = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
+gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "9df6f753841792b73d7357edf480dbb85fb71818" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "9df6f753841792b73d7357edf480dbb85fb71818" }
+gpui-pre-platform = { git = "https://github.com/panzhifu/gpui-folio", rev = "9df6f753841792b73d7357edf480dbb85fb71818" }

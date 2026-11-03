@@ -2018,8 +2018,7 @@ impl PlatformWindow for AndroidPlatformWindow {
     }
 
     fn on_display_changed(&self, _callback: Box<dyn FnMut()>) {
-        // Android windows are bound to one surface; the host recreates the
-        // surface when the display changes.
+        // An Android window stays on its single display for its lifetime; no-op.
     }
 
     fn on_should_close(&self, _callback: Box<dyn FnMut() -> bool>) {
