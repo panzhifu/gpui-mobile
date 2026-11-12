@@ -161,9 +161,12 @@ pub fn size<T>(width: T, height: T) -> Size<T> {
 
 // ── sub-modules ──────────────────────────────────────────────────────────────
 
+pub mod clipboard;
 pub mod dispatcher;
 pub mod display;
+pub mod file_access;
 pub mod file_picker;
+pub mod ime;
 pub mod keyboard;
 pub mod logging;
 pub mod main_thread;
@@ -177,6 +180,7 @@ pub mod xcomponent;
 
 pub use dispatcher::OhosDispatcher;
 pub use display::OhosDisplay;
+pub use file_access::{FileAccess, Failure as GrantFailure, READ as GRANT_READ, WRITE as GRANT_WRITE};
 pub use keyboard::*;
 pub use logging::init_logger;
 pub use platform::{OhosPlatform, SharedPlatform};
@@ -379,12 +383,14 @@ pub fn navigation_bar_color() -> Option<u32> {
 pub fn show_keyboard(keyboard_type: crate::KeyboardType) {
     log::debug!("ohos::show_keyboard({keyboard_type:?})");
     platform::request_show_keyboard(keyboard_type);
+    ime::show_keyboard();
 }
 
 /// Hide the software keyboard.
 pub fn hide_keyboard() {
     log::debug!("ohos::hide_keyboard()");
     platform::request_hide_keyboard();
+    ime::hide_keyboard();
 }
 
 // ── shared logging helper ─────────────────────────────────────────────────────

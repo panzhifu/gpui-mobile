@@ -39,6 +39,13 @@
       }
     ],
     "extensionAbilities": [],
-    "requestPermissions": []
+    "requestPermissions": [
+      {
+        // Lets `fileShare.persistPermission` turn a picked folder's temporary
+        // grant into a persistent one (needed to keep a library directory across
+        // restarts).  system_grant / normal: no runtime dialog.
+        "name": "ohos.permission.FILE_ACCESS_PERSIST"
+      }
+    ]
   }
 }

@@ -255,7 +255,11 @@ pub fn set_handler(handler: Box<dyn XComponentHandler>) {
 ///
 /// Returns the raw status from `OH_NativeXComponent_RegisterCallback`
 /// (`0` = success).
-pub fn register(component: *mut OhNativeXComponent) -> i32 {
+///
+/// # Safety
+/// `component` must be the live `OH_NativeXComponent` the ArkUI runtime handed to
+/// the module, and must stay valid for the duration of the call.
+pub unsafe fn register(component: *mut OhNativeXComponent) -> i32 {
     let callbacks = CALLBACKS.get_or_init(|| OhNativeXComponentCallback {
         on_surface_created: Some(on_surface_created),
         on_surface_changed: Some(on_surface_changed),

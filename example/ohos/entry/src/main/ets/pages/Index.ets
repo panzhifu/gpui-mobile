@@ -1,5 +1,6 @@
 import native from 'libgpui_mobile_example.so';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { registerFolderPicker } from '../common/folder_picker';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'GpuiExample';
@@ -27,6 +28,16 @@ struct Index {
       });
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'nativeSetKeyboardCallback failed');
+    }
+
+    // File / folder picker.  The NDK has no picker, so GPUI's
+    // `prompt_for_paths` arrives here as `(requestId, mode)` and the answer goes
+    // back through `nativeDeliverPick` / `nativeFailPick`.  See
+    // `common/folder_picker.ets` for the protocol and the persist step.
+    try {
+      registerFolderPicker(native);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'registerFolderPicker failed: %{public}s', JSON.stringify(e));
     }
   }
 

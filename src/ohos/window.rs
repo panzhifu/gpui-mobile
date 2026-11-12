@@ -814,7 +814,7 @@ impl Drop for OhosWindow {
 pub struct OhosPlatformWindow {
     window: Arc<OhosWindow>,
     display: Option<Rc<dyn PlatformDisplay>>,
-    input_handler: Option<PlatformInputHandler>,
+    input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
     title: String,
     momentum: Arc<Mutex<MomentumState>>,
     momentum_input_cb:
@@ -829,7 +829,7 @@ impl OhosPlatformWindow {
         Self {
             window,
             display,
-            input_handler: None,
+            input_handler: Rc::new(RefCell::new(None)),
             title: String::new(),
             momentum: Arc::new(Mutex::new(MomentumState {
                 velocity_tracker: VelocityTracker::new(),
@@ -939,11 +939,13 @@ impl PlatformWindow for OhosPlatformWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
-        self.input_handler = Some(input_handler);
+        *self.input_handler.borrow_mut() = Some(input_handler);
+        super::ime::attach(self.input_handler.clone(), self.momentum_input_cb.clone());
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
-        self.input_handler.take()
+        super::ime::detach();
+        self.input_handler.borrow_mut().take()
     }
 
     fn prompt(
@@ -1027,7 +1029,7 @@ impl PlatformWindow for OhosPlatformWindow {
 
                     let position = gpui::point(gpui::px(pos_x), gpui::px(pos_y));
                     if let Some(mut guard) = input_cb.try_lock() {
-                        let _ = guard(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                        let _ = guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
                             position,
                             delta: gpui::ScrollDelta::Pixels(gpui::point(
                                 gpui::px(dx),
@@ -1035,6 +1037,7 @@ impl PlatformWindow for OhosPlatformWindow {
                             )),
                             modifiers: gpui::Modifiers::default(),
                             touch_phase: phase,
+                            source: gpui::ScrollSource::Touch,
                         }));
                     }
                 } else if ms.scroller.is_active() {
@@ -1047,7 +1050,7 @@ impl PlatformWindow for OhosPlatformWindow {
 
                         if let Some(mut guard) = input_cb.try_lock() {
                             let _ =
-                                guard(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                                guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
                                     position,
                                     delta: gpui::ScrollDelta::Pixels(gpui::point(
                                         gpui::px(delta.dx),
@@ -1055,10 +1058,11 @@ impl PlatformWindow for OhosPlatformWindow {
                                     )),
                                     modifiers: gpui::Modifiers::default(),
                                     touch_phase: gpui::TouchPhase::Moved,
+                                    source: gpui::ScrollSource::Touch,
                                 }));
                             if fling_ended {
-                                let _ = guard(gpui::PlatformInput::ScrollWheel(
-                                    gpui::ScrollWheelEvent {
+                                let _ = guard(gpui::PlatformInput::Scroll(
+                                    gpui::ScrollEvent {
                                         position,
                                         delta: gpui::ScrollDelta::Pixels(gpui::point(
                                             gpui::px(0.0),
@@ -1066,6 +1070,7 @@ impl PlatformWindow for OhosPlatformWindow {
                                         )),
                                         modifiers: gpui::Modifiers::default(),
                                         touch_phase: gpui::TouchPhase::Ended,
+                                        source: gpui::ScrollSource::Touch,
                                     },
                                 ));
                             }
@@ -1078,7 +1083,7 @@ impl PlatformWindow for OhosPlatformWindow {
                         drop(ms);
                         if let Some(mut guard) = input_cb.try_lock() {
                             let _ =
-                                guard(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                                guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
                                     position: pos,
                                     delta: gpui::ScrollDelta::Pixels(gpui::point(
                                         gpui::px(0.0),
@@ -1086,6 +1091,7 @@ impl PlatformWindow for OhosPlatformWindow {
                                     )),
                                     modifiers: gpui::Modifiers::default(),
                                     touch_phase: gpui::TouchPhase::Ended,
+                                    source: gpui::ScrollSource::Touch,
                                 }));
                         }
                     }
@@ -1262,8 +1268,8 @@ impl PlatformWindow for OhosPlatformWindow {
                                 drop(ms);
 
                                 let mut guard = cb.lock();
-                                let _ = guard(gpui::PlatformInput::ScrollWheel(
-                                    gpui::ScrollWheelEvent {
+                                let _ = guard(gpui::PlatformInput::Scroll(
+                                    gpui::ScrollEvent {
                                         position,
                                         delta: gpui::ScrollDelta::Pixels(gpui::point(
                                             gpui::px(total_dx),
@@ -1271,6 +1277,7 @@ impl PlatformWindow for OhosPlatformWindow {
                                         )),
                                         modifiers,
                                         touch_phase: gpui::TouchPhase::Ended,
+                                        source: gpui::ScrollSource::Touch,
                                     },
                                 ));
                                 let _ = guard(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
@@ -1452,8 +1459,8 @@ impl PlatformWindow for OhosPlatformWindow {
         self.window.gpu_specs()
     }
 
-    fn update_ime_position(&self, _bounds: gpui::Bounds<gpui::Pixels>) {
-        // The IME candidate window position is set from ArkTS (see `napi.rs`).
+    fn update_ime_position(&self, bounds: gpui::Bounds<gpui::Pixels>) {
+        super::ime::update_cursor(bounds);
     }
 }
 

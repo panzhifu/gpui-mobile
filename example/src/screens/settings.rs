@@ -3,7 +3,7 @@
 //! This screen demonstrates interactive toggles and controls that mutate shared
 //! state on the `Router` and trigger re-renders via `cx.notify()`.
 
-use gpui::{div, prelude::*, px, rgb, App, MouseDownEvent, Window};
+use gpui::{div, prelude::*, px, rgb, App, MouseDownEvent, PathPromptOptions, Window};
 
 use super::{Router, BLUE, GREEN, LIGHT_CARD_BG, LIGHT_DIVIDER, LIGHT_SUBTEXT, LIGHT_TEXT, MANTLE, MAUVE, PEACH, RED, SURFACE0, SURFACE1, TEXT, YELLOW};
 
@@ -17,6 +17,14 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
     let sub_text = if dark_mode { super::SUBTEXT } else { LIGHT_SUBTEXT };
     let card_bg = if dark_mode { SURFACE0 } else { LIGHT_CARD_BG };
     let divider_color = if dark_mode { SURFACE1 } else { LIGHT_DIVIDER };
+    // The row is a live readout as well as the picker button: after a pick it
+    // shows the real path (or "(cancelled)"), so a failed bridge is visible
+    // instead of looking like a dead row.
+    let folder_hint = router
+        .picked_folder
+        .as_ref()
+        .map(|folder| folder.to_string())
+        .unwrap_or_else(|| "Pick a directory with the system picker".to_string());
 
     div()
         .flex()
@@ -117,6 +125,52 @@ pub fn render(router: &Router, cx: &mut gpui::Context<Router>) -> impl IntoEleme
                 cx.notify();
             }),
         )))
+        // ── Section: Files ───────────────────────────────────────────────
+        .child(section_header("Files", sub_text))
+        .child(
+            settings_card(card_bg).child(action_row(
+                "[F]",
+                "Choose Folder",
+                &folder_hint,
+                GREEN,
+                text_color,
+                sub_text,
+                cx.listener(|this, _event, _window, cx| {
+                    // `prompt_for_paths` forwards to the platform picker.  On
+                    // HarmonyOS that is the ArkTS `DocumentViewPicker` bridged by
+                    // `gpui_mobile::ohos::file_picker`; the host page registers it
+                    // in `example/ohos/.../common/folder_picker.ets`.
+                    let receiver = cx.prompt_for_paths(PathPromptOptions {
+                        files: false,
+                        directories: true,
+                        multiple: false,
+                        prompt: None,
+                    });
+                    this.picked_folder = Some("Choosing…".into());
+                    cx.notify();
+                    cx.spawn(async move |this, cx| {
+                        let picked = match receiver.await {
+                            Ok(Ok(Some(mut paths))) => paths.pop().map(|p| p.display().to_string()),
+                            Ok(Ok(None)) => None,
+                            Ok(Err(err)) => {
+                                log::warn!("prompt_for_paths: {err}");
+                                None
+                            }
+                            Err(_) => None,
+                        };
+                        let _ = this.update(cx, |this, cx| {
+                            this.picked_folder = Some(
+                                picked
+                                    .unwrap_or_else(|| "(cancelled)".to_string())
+                                    .into(),
+                            );
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }),
+            )),
+        )
         // ── Section: Theme Preview ───────────────────────────────────────
         .child(section_header("Theme Preview", sub_text))
         .child(

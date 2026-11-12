@@ -188,6 +188,9 @@ pub struct Router {
     pub user_name: SharedString,
     /// A flag toggled in Settings.
     pub dark_mode: bool,
+    /// Last folder returned by the system picker (Settings → Files).  `None`
+    /// before the first pick; the row shows a hint instead.
+    pub picked_folder: Option<SharedString>,
     /// Navigation history stack for back navigation.
     history: Vec<Screen>,
     /// Safe area insets (logical pixels) to pad around system chrome.
@@ -232,6 +235,7 @@ impl Router {
             tap_count: 0,
             user_name: user_name.into(),
             dark_mode: true,
+            picked_folder: None,
             history,
             safe_area,
             animation_playground: None,

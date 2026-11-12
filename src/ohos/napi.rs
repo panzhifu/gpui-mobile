@@ -249,6 +249,10 @@ static KEYBOARD_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// The ArkTS function registered by `nativeSetFolderPicker`.
 static PICKER_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
+/// The ArkTS function registered by `nativeSetClipboard` — writes text to the
+/// system pasteboard (`@ohos.pasteboard`).
+static CLIPBOARD_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Returns the global platform singleton.
 ///
 /// # Panics
@@ -351,6 +355,13 @@ pub unsafe fn install(
     );
     register_function(env, exports, c"nativeDeliverPick", native_deliver_pick);
     register_function(env, exports, c"nativeFailPick", native_fail_pick);
+    register_function(env, exports, c"nativeSetClipboard", native_set_clipboard);
+    register_function(
+        env,
+        exports,
+        c"nativeClipboardChanged",
+        native_clipboard_changed,
+    );
 
     // 2. Create the platform singleton and start the (non-blocking) GPUI app —
     //    exactly once, and keep the handle.
@@ -423,7 +434,7 @@ fn bind_xcomponent(
         platform: platform.clone(),
     }));
     let component = raw as *mut xcomponent::OhNativeXComponent;
-    let status = xcomponent::register(component);
+    let status = unsafe { xcomponent::register(component) };
     if status != xcomponent::RESULT_SUCCESS {
         return Err(format!(
             "OH_NativeXComponent_RegisterCallback status={status}"
@@ -874,6 +885,89 @@ extern "C" fn native_fail_pick(env: NapiEnv, info: NapiCallbackInfo) -> NapiValu
         if let (Some(id), Some(reason)) = (arg_f64(env, argv[0]), arg_string(env, argv[1])) {
             super::file_picker::fail(id as u64, &reason);
         }
+    }
+    undefined(env)
+}
+
+// ── clipboard ─────────────────────────────────────────────────────────────────
+
+/// `nativeSetClipboard(fn)` — ArkTS registers `(text: string) => void` that writes
+/// text to the system pasteboard (`@ohos.pasteboard`). The host should also watch
+/// `systemPasteboard.on('update', …)` and push changes back through
+/// `nativeClipboardChanged`, so the synchronous GPUI read stays current.
+extern "C" fn native_set_clipboard(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    ensure_main_thread_hop(env);
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let value = argv[0];
+    let mut ty: c_int = 0;
+    if unsafe { napi_typeof(env, value, &mut ty as *mut _) } != NAPI_OK || ty != NAPI_FUNCTION {
+        log::warn!("nativeSetClipboard: argument is not a function");
+        return undefined(env);
+    }
+
+    let mut reference: NapiRef = std::ptr::null_mut();
+    if unsafe { napi_create_reference(env, value, 1, &mut reference as *mut _) } != NAPI_OK {
+        log::warn!("nativeSetClipboard: napi_create_reference failed");
+        return undefined(env);
+    }
+    CLIPBOARD_REF.store(reference, Ordering::Release);
+
+    super::clipboard::set_write_handler(call_clipboard_write);
+    log::info!("napi: clipboard bridge registered");
+    undefined(env)
+}
+
+/// Forward a write to the ArkTS pasteboard function. Calling into JS is only legal
+/// on the env-owning UI thread, so hop first when GPUI writes from elsewhere.
+fn call_clipboard_write(text: &str) {
+    let on_ui_thread = try_platform().is_none_or(|p| p.dispatcher().is_main_thread());
+    if !on_ui_thread {
+        let text = text.to_string();
+        if !super::main_thread::post(Box::new(move || call_clipboard_write(&text))) {
+            log::warn!("clipboard: no UI-thread hop; write stayed in the native cache");
+        }
+        return;
+    }
+
+    let env = NAPI_ENV.load(Ordering::Acquire);
+    let reference = CLIPBOARD_REF.load(Ordering::Acquire);
+    if env.is_null() || reference.is_null() {
+        return;
+    }
+
+    let mut func: NapiValue = std::ptr::null_mut();
+    if unsafe { napi_get_reference_value(env, reference, &mut func as *mut _) } != NAPI_OK
+        || func.is_null()
+    {
+        return;
+    }
+
+    // Explicit length, not a CString: pasteboard text may contain interior NUL,
+    // and napi_create_string_utf8 reads exactly `len` bytes when length is given.
+    let mut arg: NapiValue = std::ptr::null_mut();
+    unsafe {
+        napi_create_string_utf8(env, text.as_ptr() as *const c_char, text.len(), &mut arg as *mut _)
+    };
+    let argv = [arg];
+    let mut result: NapiValue = std::ptr::null_mut();
+    let status =
+        unsafe { napi_call_function(env, undefined(env), func, 1, argv.as_ptr(), &mut result) };
+    if status != NAPI_OK {
+        log::warn!("napi_call_function(clipboard) status={status}");
+    }
+}
+
+/// `nativeClipboardChanged(text)` — ArkTS pushes the current pasteboard text
+/// (empty ⇒ cleared or non-text) into the native cache that backs GPUI's
+/// synchronous `read_from_clipboard`.
+extern "C" fn native_clipboard_changed(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc >= 1 {
+        let text = arg_string(env, argv[0]).unwrap_or_default();
+        super::clipboard::deliver(&text);
     }
     undefined(env)
 }

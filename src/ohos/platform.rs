@@ -56,32 +56,6 @@ use super::{
 };
 use gpui_wgpu::GpuContext;
 
-// ── stub: clipboard ───────────────────────────────────────────────────────────
-
-/// HarmonyOS clipboard.
-///
-/// A full implementation would round-trip through ArkTS (`@ohos.pasteboard`).
-/// Until then this is an in-process string store so the rest of the platform
-/// compiles and the example works.
-#[derive(Default)]
-pub struct OhosClipboard {
-    contents: Option<String>,
-}
-
-impl OhosClipboard {
-    pub fn read(&self) -> Option<String> {
-        self.contents.clone()
-    }
-
-    pub fn write(&mut self, text: String) {
-        self.contents = Some(text);
-    }
-
-    pub fn clear(&mut self) {
-        self.contents = None;
-    }
-}
-
 // ── stub: credential store ────────────────────────────────────────────────────
 
 /// HarmonyOS credential store.
@@ -153,7 +127,6 @@ struct OhosPlatformState {
     windows: WindowList,
     displays: DisplayList,
     text_system: Arc<CosmicTextSystem>,
-    clipboard: OhosClipboard,
     credentials: OhosCredentialStore,
 
     /// The `on_finish_launching` closure passed to `run()`.
@@ -285,7 +258,6 @@ impl OhosPlatform {
                 windows: WindowList::default(),
                 displays,
                 text_system,
-                clipboard: OhosClipboard::default(),
                 credentials: OhosCredentialStore::default(),
                 finish_launching: None,
                 quit_callback: None,
@@ -496,11 +468,11 @@ impl OhosPlatform {
     // ── clipboard / credentials ───────────────────────────────────────────────
 
     pub fn write_to_clipboard_impl(&self, text: String) {
-        self.state.lock().clipboard.write(text);
+        super::clipboard::write(&text);
     }
 
     pub fn read_from_clipboard_impl(&self) -> Option<String> {
-        self.state.lock().clipboard.read()
+        super::clipboard::read()
     }
 
     pub fn write_credentials_impl(
@@ -814,18 +786,11 @@ impl Platform for OhosPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        self.state
-            .lock()
-            .clipboard
-            .read()
-            .map(ClipboardItem::new_string)
+        super::clipboard::read().map(ClipboardItem::new_string)
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        self.state
-            .lock()
-            .clipboard
-            .write(item.text().unwrap_or_default());
+        super::clipboard::write(&item.text().unwrap_or_default());
     }
 
     // The OHOS triple reports `target_os = "linux"`, so the trait additionally
@@ -857,6 +822,15 @@ impl Platform for OhosPlatform {
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         let result = self.state.lock().credentials.delete(url, "default");
         Task::ready(result)
+    }
+
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        // OHOS 三元组报 `target_os = "linux"`，gpui-ohos 上游也取 Linux；
+        // 枚举里没有 HarmonyOS 这一格，取 Unknown 反而会丢掉输入约定。
+        gpui::PlatformInfo {
+            os: gpui::OperatingSystem::Linux,
+            target: gpui::PlatformTarget::Native,
+        }
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
@@ -1069,6 +1043,9 @@ impl Platform for SharedPlatform {
     }
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         <OhosPlatform as Platform>::delete_credentials(&self.0, url)
+    }
+    fn platform_info(&self) -> gpui::PlatformInfo {
+        <OhosPlatform as Platform>::platform_info(&self.0)
     }
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         <OhosPlatform as Platform>::keyboard_layout(&self.0)

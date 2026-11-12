@@ -22,6 +22,16 @@ declare module 'libgpui_mobile_example.so' {
      * keyboard-type string to show the IME, or `undefined` to hide it.
      */
     nativeSetKeyboardCallback(cb: (kind?: string) => void): void;
+    /**
+     * Register the file / folder picker. Native calls `cb(requestId, mode)` with
+     * mode `folders` | `files` | `mixed`; the answer goes back through
+     * `nativeDeliverPick` or `nativeFailPick` with the same `requestId`.
+     */
+    nativeSetFolderPicker(cb: (requestId: number, mode: string) => void): void;
+    /** Answer a picker request: real paths joined with U+0001, or '' for cancel. */
+    nativeDeliverPick(requestId: number, paths: string): void;
+    /** Fail a picker request with a reason the app can show. */
+    nativeFailPick(requestId: number, reason: string): void;
   }
 
   const native: GpuiNative;

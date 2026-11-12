@@ -61,6 +61,6 @@ debug = true
 # 平台，鸿蒙报 `target_os = "linux"`，于是桌面 `gpui-pre-linux` 的
 # `-lxcb -lxkbcommon -lxkbcommon-x11` 进了链接行，而 OHOS 的 sysroot 里没有这些库。
 [patch.crates-io]
-gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
-gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
-gpui-pre-platform = { git = "https://github.com/panzhifu/gpui-folio", rev = "9790a60d619522db8ec904ddfe62931755b7b130" }
+gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "c261858052370b83a4f8725f42628c5dde0c459c" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "c261858052370b83a4f8725f42628c5dde0c459c" }
+gpui-pre-platform = { git = "https://github.com/panzhifu/gpui-folio", rev = "c261858052370b83a4f8725f42628c5dde0c459c" }
