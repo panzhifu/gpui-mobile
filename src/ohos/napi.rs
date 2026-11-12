@@ -117,6 +117,7 @@ extern "C" {
         result: *mut usize,
     ) -> NapiStatus;
     fn napi_get_undefined(env: NapiEnv, result: *mut NapiValue) -> NapiStatus;
+    fn napi_get_boolean(env: NapiEnv, value: bool, result: *mut NapiValue) -> NapiStatus;
     fn napi_create_string_utf8(
         env: NapiEnv,
         str_: *const c_char,
@@ -253,6 +254,19 @@ static PICKER_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// system pasteboard (`@ohos.pasteboard`).
 static CLIPBOARD_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
+/// The ArkTS function registered by `nativeSetUrlHandler` — opens a URL/WANT
+/// (`UIAbilityContext.openLink`).
+static URL_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The process-wide file-access store, built when ArkTS delivers `filesDir`.
+static FILE_ACCESS: std::sync::OnceLock<
+    std::sync::Arc<super::file_access::FileAccess>,
+> = std::sync::OnceLock::new();
+
+/// The ArkTS function registered by `nativeSetKeepScreenOnHandler` — toggles
+/// `window.setWindowKeepScreenOn` on the main window.
+static KEEP_SCREEN_ON_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Returns the global platform singleton.
 ///
 /// # Panics
@@ -340,6 +354,27 @@ pub unsafe fn install(
     );
     register_function(env, exports, c"nativeOnForeground", native_on_foreground);
     register_function(env, exports, c"nativeOnBackground", native_on_background);
+    register_function(
+        env,
+        exports,
+        c"nativeOnMemoryWarning",
+        native_on_memory_warning,
+    );
+    register_function(env, exports, c"nativeSetAppearance", native_set_appearance);
+    register_function(env, exports, c"nativeSetUrlHandler", native_set_url_handler);
+    register_function(
+        env,
+        exports,
+        c"nativeSetKeepScreenOnHandler",
+        native_set_keep_screen_on_handler,
+    );
+    register_function(env, exports, c"nativeSetFilesDir", native_set_files_dir);
+    register_function(
+        env,
+        exports,
+        c"nativeSetResourceManager",
+        native_set_resource_manager,
+    );
     register_function(env, exports, c"nativeOnDestroy", native_on_destroy);
     register_function(
         env,
@@ -674,6 +709,217 @@ extern "C" fn native_set_safe_area_insets(env: NapiEnv, info: NapiCallbackInfo) 
     undefined(env)
 }
 
+/// `nativeSetAppearance(mode)` — ArkTS reports the system color mode
+/// (`dark` | `light`), from `onWindowStageCreate` and every
+/// `onConfigurationUpdate`.  Feeds `Platform::window_appearance` and the live
+/// windows' appearance callbacks.
+extern "C" fn native_set_appearance(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let mode = arg_string(env, argv[0]).unwrap_or_default();
+    let appearance = match mode.as_str() {
+        "dark" => Some(gpui::WindowAppearance::Dark),
+        "light" => Some(gpui::WindowAppearance::Light),
+        _ => None,
+    };
+    if let Some(appearance) = appearance {
+        if let Some(p) = try_platform() {
+            p.set_appearance(appearance);
+        }
+        log::info!("napi: appearance → {mode}");
+    } else {
+        log::warn!("nativeSetAppearance: unknown mode {mode:?}");
+    }
+    undefined(env)
+}
+
+/// `nativeSetUrlHandler(fn)` — ArkTS registers `(url: string) => void` that
+/// opens the URL as a WANT (`openLink`). Without it `open_url` stays log-only.
+extern "C" fn native_set_url_handler(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    ensure_main_thread_hop(env);
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let value = argv[0];
+    let mut ty: c_int = 0;
+    if unsafe { napi_typeof(env, value, &mut ty as *mut _) } != NAPI_OK || ty != NAPI_FUNCTION {
+        log::warn!("nativeSetUrlHandler: argument is not a function");
+        return undefined(env);
+    }
+    let mut reference: NapiRef = std::ptr::null_mut();
+    if unsafe { napi_create_reference(env, value, 1, &mut reference as *mut _) } != NAPI_OK {
+        log::warn!("nativeSetUrlHandler: napi_create_reference failed");
+        return undefined(env);
+    }
+    URL_REF.store(reference, Ordering::Release);
+    if let Some(p) = try_platform() {
+        p.set_open_url_handler(std::sync::Arc::new(call_url_open));
+    }
+    log::info!("napi: url opener registered");
+    undefined(env)
+}
+
+/// Forward `open_url` to the ArkTS opener (`openLink`). Same hop discipline as
+/// [`call_clipboard_write`]: JS calls are only legal on the env-owning thread.
+fn call_url_open(url: String) {
+    let on_ui_thread = try_platform().is_none_or(|p| p.dispatcher().is_main_thread());
+    if !on_ui_thread {
+        let for_log = url.clone();
+        if !super::main_thread::post(Box::new(move || call_url_open(url))) {
+            log::warn!("open_url: no UI-thread hop; {for_log} not opened");
+        }
+        return;
+    }
+    call_js_with_string(&URL_REF, &url, "open_url");
+}
+
+/// `nativeSetKeepScreenOnHandler(fn)` — ArkTS registers `(on: boolean) => void`
+/// that toggles `setWindowKeepScreenOn` on the main window.
+extern "C" fn native_set_keep_screen_on_handler(
+    env: NapiEnv,
+    info: NapiCallbackInfo,
+) -> NapiValue {
+    ensure_main_thread_hop(env);
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let value = argv[0];
+    let mut ty: c_int = 0;
+    if unsafe { napi_typeof(env, value, &mut ty as *mut _) } != NAPI_OK || ty != NAPI_FUNCTION {
+        log::warn!("nativeSetKeepScreenOnHandler: argument is not a function");
+        return undefined(env);
+    }
+    let mut reference: NapiRef = std::ptr::null_mut();
+    if unsafe { napi_create_reference(env, value, 1, &mut reference as *mut _) } != NAPI_OK {
+        log::warn!("nativeSetKeepScreenOnHandler: napi_create_reference failed");
+        return undefined(env);
+    }
+    KEEP_SCREEN_ON_REF.store(reference, Ordering::Release);
+    if let Some(p) = try_platform() {
+        p.set_keep_screen_on_handler(std::sync::Arc::new(|on| call_keep_screen_on(on)));
+    }
+    log::info!("napi: keep-screen-on sink registered");
+    undefined(env)
+}
+
+fn call_keep_screen_on(on: bool) {
+    let on_ui_thread = try_platform().is_none_or(|p| p.dispatcher().is_main_thread());
+    if !on_ui_thread {
+        if !super::main_thread::post(Box::new(move || call_keep_screen_on(on))) {
+            log::warn!("keep-screen-on: no UI-thread hop; state stayed native-only");
+        }
+        return;
+    }
+    let env = NAPI_ENV.load(Ordering::Acquire);
+    let reference = KEEP_SCREEN_ON_REF.load(Ordering::Acquire);
+    if env.is_null() || reference.is_null() {
+        return;
+    }
+    let mut func: NapiValue = std::ptr::null_mut();
+    if unsafe { napi_get_reference_value(env, reference, &mut func as *mut _) } != NAPI_OK {
+        return;
+    }
+    let this = undefined(env);
+    let mut arg: NapiValue = std::ptr::null_mut();
+    let flag = on;
+    unsafe {
+        if napi_get_boolean(env, flag, &mut arg as *mut _) != NAPI_OK {
+            return;
+        }
+        let argv = [arg];
+        let mut result: NapiValue = std::ptr::null_mut();
+        napi_call_function(env, this, func, 1, argv.as_ptr(), &mut result as *mut _);
+    }
+}
+
+/// `nativeSetFilesDir(path)` — ArkTS hands over `context.filesDir`. Builds the
+/// process-wide [`super::file_access::FileAccess`] (history at
+/// `<filesDir>/file-grants.txt`) and re-activates the persisted grants, so a
+/// restart can read the folders the reader already authorised.
+extern "C" fn native_set_files_dir(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let dir = arg_string(env, argv[0]).unwrap_or_default();
+    if dir.is_empty() {
+        log::warn!("nativeSetFilesDir: empty path");
+        return undefined(env);
+    }
+    let access = std::sync::Arc::new(super::file_access::FileAccess::new(Some(
+        std::path::PathBuf::from(dir).join("file-grants.txt"),
+    )));
+    match access.activate_persisted() {
+        Ok(failures) if failures.is_empty() => {
+            log::info!("file_access: persisted grants re-activated");
+        }
+        Ok(failures) => {
+            for failure in failures {
+                log::warn!("file_access: grant {}: {}", failure.uri, failure.message);
+            }
+        }
+        Err(err) => log::warn!("file_access: activate_persisted failed: {err:#}"),
+    }
+    FILE_ACCESS.set(access).ok();
+    undefined(env)
+}
+
+/// The process-wide file-access store, for host apps (folio opens books from
+/// picker-picked folders; a rejected read falls back per [`FileAccess::persist`]).
+pub fn file_access() -> Option<std::sync::Arc<super::file_access::FileAccess>> {
+    FILE_ACCESS.get().cloned()
+}
+
+/// Shared napi function call with one string argument: resolves `reference` in
+/// `env` and invokes it. Both the URL opener and any future one-string sink go
+/// through this; the clipboard keeps its own copy because its call sites hop
+/// before dispatch and carry a `&str`.
+fn call_js_with_string(reference: &AtomicPtr<c_void>, value: &str, what: &str) {
+    let env = NAPI_ENV.load(Ordering::Acquire);
+    if env.is_null() {
+        return;
+    }
+    let reference = reference.load(Ordering::Acquire);
+    if reference.is_null() {
+        return;
+    }
+    let mut func: NapiValue = std::ptr::null_mut();
+    if unsafe { napi_get_reference_value(env, reference, &mut func as *mut _) } != NAPI_OK
+        || func.is_null()
+    {
+        return;
+    }
+    let mut arg: NapiValue = std::ptr::null_mut();
+    unsafe { napi_create_string_utf8(env, value.as_ptr().cast(), value.len(), &mut arg as *mut _) };
+    let argv = [arg];
+    let this = undefined(env);
+    let mut result: NapiValue = std::ptr::null_mut();
+    unsafe { napi_call_function(env, this, func, 1, argv.as_ptr(), &mut result as *mut _) };
+    let _ = what;
+}
+
+/// `nativeSetResourceManager(resManager)` — ArkTS hands over
+/// `context.resourceManager`, which the rawfile NDK surface needs to unwrap.
+/// After this lands, the bundled emoji font is loaded into the text system
+/// (the OHOS twin of Android's deferred emoji load).
+extern "C" fn native_set_resource_manager(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        log::warn!("nativeSetResourceManager: missing resourceManager argument");
+        return undefined(env);
+    }
+    if super::rawfile::init(env, argv[0]) {
+        if let Some(p) = try_platform() {
+            p.load_bundled_emoji_font();
+        }
+    }
+    undefined(env)
+}
+
 extern "C" fn native_on_foreground(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
     ensure_main_thread_hop(env);
     log::info!("napi: onForeground");
@@ -682,6 +928,9 @@ extern "C" fn native_on_foreground(env: NapiEnv, _info: NapiCallbackInfo) -> Nap
         if let Some(w) = p.primary_window() {
             w.set_active(true);
         }
+        // Android 臂同一条：resume → `Active`（GPUI 的消费方按这一档恢复输入与
+        // 动画；OHOS 没有独立的 GainedFocus 桥，进前台即视为可交互）。
+        p.emit_app_lifecycle(gpui::AppLifecyclePhase::Active);
     }
     undefined(env)
 }
@@ -693,6 +942,19 @@ extern "C" fn native_on_background(env: NapiEnv, _info: NapiCallbackInfo) -> Nap
         if let Some(w) = p.primary_window() {
             w.set_active(false);
         }
+        p.emit_app_lifecycle(gpui::AppLifecyclePhase::Background);
+    }
+    undefined(env)
+}
+
+/// `nativeOnMemoryWarning()` — ArkTS `onMemoryLevel`（`MEMORY_LEVEL_*`）转进来。
+/// OHOS 的档位分级对 GPUI 只有一个语义：「该释放缓存了」，与 Android 的
+/// `onTrimMemory` 同一条。
+extern "C" fn native_on_memory_warning(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    ensure_main_thread_hop(env);
+    log::info!("napi: onMemoryWarning");
+    if let Some(p) = try_platform() {
+        p.notify_memory_warning();
     }
     undefined(env)
 }

@@ -49,6 +49,7 @@
 #[link(name = "ace_napi.z", kind = "dylib")]
 #[link(name = "ace_ndk.z", kind = "dylib")]
 #[link(name = "native_vsync", kind = "dylib")]
+#[link(name = "rawfile.z", kind = "dylib")]
 extern "C" {}
 
 // ── geometry types ───────────────────────────────────────────────────────────
@@ -172,6 +173,7 @@ pub mod logging;
 pub mod main_thread;
 pub mod napi;
 pub mod platform;
+pub mod rawfile;
 pub mod vsync;
 pub mod window;
 pub mod xcomponent;

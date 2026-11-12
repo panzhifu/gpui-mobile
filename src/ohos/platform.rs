@@ -30,10 +30,10 @@
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
-    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
-    ForegroundExecutor, KeybindingKeystroke, Keymap, Keystroke, Menu, MenuItem, PathPromptOptions,
-    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Task, ThermalState, WindowAppearance, WindowParams,
+    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem,
+    CursorStyle, ForegroundExecutor, KeybindingKeystroke, Keymap, Keystroke, Menu, MenuItem,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, Task, ThermalState, WindowAppearance, WindowParams,
 };
 use gpui_wgpu::CosmicTextSystem;
 use parking_lot::Mutex;
@@ -138,6 +138,30 @@ struct OhosPlatformState {
     reopen_callback: Option<Box<dyn FnMut() + Send>>,
     open_urls_callback: Option<Box<dyn FnMut(Vec<String>) + Send>>,
     keyboard_layout_callback: Option<Box<dyn FnMut() + Send>>,
+
+    /// Mobile lifecycle phases. Registered through `Platform::on_app_lifecycle`;
+    /// fired from the ArkTS `onForeground` / `onBackground` callbacks on the
+    /// GPUI thread（Android 臂 `emit_app_lifecycle` 的 OHOS 孪生）。
+    app_lifecycle_callback: Option<Box<dyn FnMut(AppLifecyclePhase) + Send>>,
+
+    /// Memory-pressure warnings. Registered through `Platform::on_memory_warning`;
+    /// fired from the ArkTS `onMemoryLevel` callback（OHOS 的 `MEMORY_LEVEL_*`）。
+    memory_warning_callback: Option<Box<dyn FnMut() + Send>>,
+
+    /// The system color mode as last reported by ArkTS
+    /// (`nativeSetAppearance`, dark | light). `None` before the first report.
+    appearance: Option<WindowAppearance>,
+
+    /// Outgoing URL opener. Installed by ArkTS through `nativeSetUrlHandler`
+    /// (`openLink` lives there; the NDK has no WANT launcher). `open_url`
+    /// forwards to it; `None` keeps the log-only fallback.
+    open_url_handler: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+
+    /// Keep-screen-on sink. Installed by ArkTS through
+    /// `nativeSetKeepScreenOnHandler`; `prevent_idle_sleep` counts active
+    /// reasons and fires `true` on 0→1, `false` on 1→0.
+    keep_screen_on_handler: Option<std::sync::Arc<dyn Fn(bool) + Send + Sync>>,
+    idle_sleep_locks: usize,
 
     is_active: bool,
     headless: bool,
@@ -264,6 +288,12 @@ impl OhosPlatform {
                 reopen_callback: None,
                 open_urls_callback: None,
                 keyboard_layout_callback: None,
+                app_lifecycle_callback: None,
+                memory_warning_callback: None,
+                appearance: None,
+                open_url_handler: None,
+                keep_screen_on_handler: None,
+                idle_sleep_locks: 0,
                 is_active: false,
                 headless,
                 preferred_backend: OhosBackend::Gles,
@@ -371,6 +401,93 @@ impl OhosPlatform {
     /// Called when the app moves to the background.
     pub fn did_enter_background(&self) {
         self.state.lock().is_active = false;
+    }
+
+    /// Fire the lifecycle callback registered through `Platform::on_app_lifecycle`.
+    /// Android 臂 `emit_app_lifecycle` 的 OHOS 孪生：由 ArkTS `onForeground` /
+    /// `onBackground` 的 NAPI 处理器在 GPUI 线程上调用。
+    pub fn emit_app_lifecycle(&self, phase: AppLifecyclePhase) {
+        let mut callback = self.state.lock().app_lifecycle_callback.take();
+        if let Some(callback) = callback.as_mut() {
+            callback(phase);
+        }
+        self.state.lock().app_lifecycle_callback = callback;
+    }
+
+    /// Fire the memory-pressure callback registered through
+    /// `Platform::on_memory_warning`。由 ArkTS `onMemoryLevel`（`MEMORY_LEVEL_*`）
+    /// 的 NAPI 处理器调用。
+    pub fn notify_memory_warning(&self) {
+        let mut callback = self.state.lock().memory_warning_callback.take();
+        if let Some(callback) = callback.as_mut() {
+            callback();
+        }
+        self.state.lock().memory_warning_callback = callback;
+    }
+
+    /// ArkTS 报来的系统深浅色（`nativeSetAppearance`，dark | light）。
+    /// `window_appearance` 从这里读，`set_window_appearance`（写系统）仍是 no-op。
+    /// 活着的窗口同步走 `OhosWindow::set_appearance`——它更新窗口状态并触发
+    /// GPUI 注册的 `on_appearance_changed` 回调（`window.rs` 的既有管线）。
+    pub fn set_appearance(&self, appearance: WindowAppearance) {
+        self.state.lock().appearance = Some(appearance);
+        if let Some(window) = self.primary_window() {
+            // OhosWindow 收的是这个模块自己的 WindowAppearance stub
+            // （window.rs 的几何/外观 stub 家族，不是 gpui 的枚举）；ArkTS 只报
+            // dark/light 两档，高对比两档保持窗口侧的现值不动。
+            let stub = match appearance {
+                WindowAppearance::Dark => super::window::WindowAppearance::Dark,
+                _ => super::window::WindowAppearance::Light,
+            };
+            window.set_appearance(stub);
+        }
+    }
+
+    /// Install the ArkTS URL opener (see `open_url`).
+    pub fn set_open_url_handler(&self, handler: std::sync::Arc<dyn Fn(String) + Send + Sync>) {
+        self.state.lock().open_url_handler = Some(handler);
+    }
+
+    /// Install the ArkTS keep-screen-on sink (see `prevent_idle_sleep`).
+    pub fn set_keep_screen_on_handler(
+        &self,
+        handler: std::sync::Arc<dyn Fn(bool) + Send + Sync>,
+    ) {
+        self.state.lock().keep_screen_on_handler = Some(handler);
+    }
+
+    /// Load the bundled emoji font from the HAP's rawfile directory into the
+    /// text system. The Android twin is `BUNDLED_EMOJI_FONT` +
+    /// `load_deferred_emoji_font` (`src/android/platform.rs`): the system
+    /// emoji fonts on this platform are either a CBDT build we already scanned
+    /// past (`SYSTEM_FONT_PATHS` excludes both emoji entries — a second face
+    /// with the same family name resolves unpredictably) or an unrenderable
+    /// COLRv1 build, so the copy in the HAP is the one source of truth.
+    ///
+    /// Called from the ArkTS hand-off (`nativeSetResourceManager`): rawfile
+    /// access needs the resource manager, which only exists after ArkTS
+    /// delivers `context.resourceManager`. Until then books' emoji render as
+    /// tofu for the first frames — same window as the Android deferred load.
+    pub fn load_bundled_emoji_font(&self) {
+        const BUNDLED_EMOJI_FONT: &str = "fonts/NotoColorEmoji.ttf";
+        if !super::rawfile::ready() {
+            log::warn!("emoji: rawfile not ready; bundling skipped");
+            return;
+        }
+        match super::rawfile::load(BUNDLED_EMOJI_FONT) {
+            Some(bytes) => {
+                let text_system = self.state.lock().text_system.clone();
+                if let Err(e) = text_system.add_fonts(vec![std::borrow::Cow::Owned(bytes)]) {
+                    log::warn!("emoji: failed to add bundled font: {e:#}");
+                } else {
+                    log::info!("emoji: bundled font loaded from rawfile");
+                }
+            }
+            None => log::warn!(
+                "emoji: {BUNDLED_EMOJI_FONT} missing from rawfile — \
+                 add it under example/ohos/entry/src/main/resources/rawfile/"
+            ),
+        }
     }
 
     /// Deliver URLs from a deeplink.
@@ -662,11 +779,20 @@ impl Platform for OhosPlatform {
     }
 
     fn window_appearance(&self) -> WindowAppearance {
-        WindowAppearance::Dark
+        // ArkTS 把系统深浅色上报进来（`nativeSetAppearance`）；读不到上报前先
+        // 停在 Dark —— 与这条 trait 在 fork 上的历史行为一致。
+        self.state
+            .lock()
+            .appearance
+            .unwrap_or(WindowAppearance::Dark)
     }
 
     fn open_url(&self, url: &str) {
-        log::info!("OhosPlatform::open_url({url}) — ArkTS launch not yet wired");
+        let handler = self.state.lock().open_url_handler.clone();
+        match handler {
+            Some(handler) => handler(url.to_string()),
+            None => log::info!("OhosPlatform::open_url({url}) — no ArkTS handler registered"),
+        }
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
@@ -692,12 +818,10 @@ impl Platform for OhosPlatform {
 
     fn prompt_for_new_path(
         &self,
-        _directory: &Path,
-        _suggested_name: Option<&str>,
+        directory: &Path,
+        suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
-        let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Ok(None));
-        rx
+        super::file_picker::prompt_save(directory, suggested_name)
     }
 
     fn can_select_mixed_files_and_dirs(&self) -> bool {
@@ -717,6 +841,21 @@ impl Platform for OhosPlatform {
             std::mem::transmute::<Box<dyn FnMut() -> bool>, Box<dyn FnMut() -> bool + Send>>(
                 callback,
             )
+        });
+    }
+
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
+        self.state.lock().app_lifecycle_callback = Some(unsafe {
+            std::mem::transmute::<
+                Box<dyn FnMut(AppLifecyclePhase)>,
+                Box<dyn FnMut(AppLifecyclePhase) + Send>,
+            >(callback)
+        });
+    }
+
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        self.state.lock().memory_warning_callback = Some(unsafe {
+            std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
         });
     }
 
@@ -741,11 +880,31 @@ impl Platform for OhosPlatform {
     }
 
     fn prevent_idle_sleep(&self, reason: &str) -> Task<Result<ActivityGuard>> {
-        // 没接 OHOS 的 `PowerManager` 后台运行申请。返回 Err 而不是假装成功：
-        // 调用方据此知道屏幕该自己管。
-        Task::ready(Err(anyhow::anyhow!(
-            "Idle sleep prevention for {reason:?} is not supported on HarmonyOS"
-        )))
+        // 计数 + ArkTS 的 `setWindowKeepScreenOn`（NDK 没有这一格）。guard 掉下
+        // 时计数归零才发 false——两个并发的翻译任务各举一手，谁结束都不该熄屏。
+        let Some(platform) = crate::ohos::napi::try_platform() else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "platform not installed yet; cannot keep the screen on for {reason:?}"
+            )));
+        };
+        {
+            let mut state = self.state.lock();
+            state.idle_sleep_locks += 1;
+            if state.idle_sleep_locks == 1 {
+                if let Some(handler) = &state.keep_screen_on_handler {
+                    handler(true);
+                }
+            }
+        }
+        Task::ready(Ok(ActivityGuard::new(move || {
+            let mut state = platform.state.lock();
+            state.idle_sleep_locks = state.idle_sleep_locks.saturating_sub(1);
+            if state.idle_sleep_locks == 0 {
+                if let Some(handler) = &state.keep_screen_on_handler {
+                    handler(false);
+                }
+            }
+        })))
     }
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
@@ -968,6 +1127,12 @@ impl Platform for SharedPlatform {
     }
     fn on_quit(&self, callback: Box<dyn FnMut() -> bool>) {
         <OhosPlatform as Platform>::on_quit(&self.0, callback)
+    }
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
+        <OhosPlatform as Platform>::on_app_lifecycle(&self.0, callback)
+    }
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        <OhosPlatform as Platform>::on_memory_warning(&self.0, callback)
     }
     fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
         <OhosPlatform as Platform>::on_displays_changed(&self.0, callback)

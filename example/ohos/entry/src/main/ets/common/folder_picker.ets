@@ -1,4 +1,4 @@
-// File / folder picking for the GPUI OHOS NAPI module.
+// File / folder picking and save dialogs for the GPUI OHOS NAPI module.
 //
 // `gpui_mobile::ohos::file_picker` owns the request/reply bookkeeping; the actual
 // picker only exists in ArkTS (`@ohos.file.picker`), so every app has to register
@@ -6,6 +6,8 @@
 //
 //   native.nativeSetFolderPicker((requestId, mode) => { ... })
 //   mode = "folders" | "files" | "mixed"
+//        | "save\u0001<dir>\u0001<suggestedName>"   // save dialog (GPUI's
+//                                                    // `prompt_for_new_path`)
 //   -> native.nativeDeliverPick(requestId, paths.join('\u0001'))   // '' == cancel
 //   -> native.nativeFailPick(requestId, reason)
 //
@@ -23,6 +25,8 @@
 //    it needs `ohos.permission.FILE_ACCESS_PERSIST` in `module.json5`
 //    (system_grant / normal, so no runtime dialog).  Failure is logged and the
 //    path is still delivered — a temporary grant is better than no picker.
+//    On the native side the same grants are re-activated after a restart
+//    (`nativeSetFilesDir` → `FileAccess::activate_persisted`).
 
 import { fileIo, fileShare, fileUri, picker } from '@kit.CoreFileKit';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -56,10 +60,14 @@ function selectModeOf(mode: string): picker.DocumentSelectMode {
 /// Upgrade a folder grant from "this process" to "until revoked".  Files are
 /// left alone: their temporary grant is enough for the copy-and-forget flow, and
 /// persisting every picked file would grow the system's grant table for nothing.
+/// Save targets **are** persisted: the reader will write into that file across
+/// sessions, so the same folder rule applies to it.
 async function persistIfFolder(uri: string, path: string, mode: string): Promise<void> {
   try {
     const isFolder: boolean =
-      mode === 'folders' || (mode === 'mixed' && fileIo.statSync(path).isDirectory());
+      mode === 'folders' ||
+      mode === 'save' ||
+      (mode === 'mixed' && fileIo.statSync(path).isDirectory());
     if (!isFolder) {
       return;
     }
@@ -75,11 +83,48 @@ async function persistIfFolder(uri: string, path: string, mode: string): Promise
   }
 }
 
+/// The save branch: `DocumentViewPicker.save` with the native side's directory
+/// and suggested name folded into `newFileUri`.  The answer is a single URI.
+async function runSave(host: FolderPickerHost, requestId: number, dir: string, name: string): Promise<void> {
+  const fileName: string = name !== '' ? name : 'output.txt';
+  const saveOptions: picker.DocumentSaveOptions = new picker.DocumentSaveOptions();
+  saveOptions.newFileUri = fileUri.getUriFromPath(`${dir}/${fileName}`);
+
+  new picker.DocumentViewPicker()
+    .save(saveOptions)
+    .then(async (uris: string[]) => {
+      if (!uris || uris.length === 0) {
+        host.nativeDeliverPick(requestId, '');
+        return;
+      }
+      const path: string = new fileUri.FileUri(uris[0]).path;
+      if (!path.startsWith('/storage/')) {
+        hilog.warn(DOMAIN, TAG, 'unusable save target: %{public}s', uris[0]);
+        host.nativeFailPick(requestId, `no real path for ${uris[0]}`);
+        return;
+      }
+      await persistIfFolder(uris[0], path, 'save');
+      host.nativeDeliverPick(requestId, path);
+    })
+    .catch((err: Error) => {
+      hilog.warn(DOMAIN, TAG, 'save rejected: %{public}s', err?.message ?? 'unknown');
+      host.nativeDeliverPick(requestId, '');
+    });
+}
+
 /// Register the picker.  Call once, after the native module is imported: the
 /// native side stores the callback in a `napi_reference`, so a later request can
 /// arrive at any time.
 export function registerFolderPicker(host: FolderPickerHost): void {
   host.nativeSetFolderPicker((requestId: number, mode: string) => {
+    // Save requests carry their payload in the mode string:
+    // `save\u0001<dir>\u0001<suggestedName>`.
+    if (mode.startsWith('save')) {
+      const parts: string[] = mode.split(SEPARATOR);
+      void runSave(host, requestId, parts[1] ?? '', parts[2] ?? '');
+      return;
+    }
+
     const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
     options.selectMode = selectModeOf(mode);
     // Folder mode ignores this (one directory per pick before API 26; API 26 has

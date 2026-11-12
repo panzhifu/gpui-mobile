@@ -26,7 +26,7 @@
 //! This module is compiled only for `target_env = "ohos"`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -37,8 +37,16 @@ use parking_lot::Mutex;
 /// The separator the ArkTS side joins picked paths with.
 pub const SEPARATOR: char = '\u{1}';
 
-/// Sends the answer back to the GPUI task that asked.
-type Pending = HashMap<u64, oneshot::Sender<Result<Option<Vec<PathBuf>>>>>;
+/// Sends the answer back to the GPUI task that asked. 挑选与另存共用一张 pending
+/// 表——`nativeDeliverPick` 只按 id 找回执，两张表会让 id 域分叉。
+enum Answer {
+    /// `prompt_for_paths`：挑出的路径（或取消）。
+    Paths(oneshot::Sender<Result<Option<Vec<PathBuf>>>>),
+    /// `prompt_for_new_path`：另存为的目标文件（或取消）。
+    Save(oneshot::Sender<Result<Option<PathBuf>>>),
+}
+
+type Pending = HashMap<u64, Answer>;
 
 /// `(request id, mode)` → start a picker on the ArkTS side. Installed by `napi.rs`.
 ///
@@ -99,8 +107,38 @@ pub fn prompt(options: PathPromptOptions) -> oneshot::Receiver<Result<Option<Vec
     let mode = mode_of(&options);
     // Register before asking: a picker already open in front of the reader could
     // answer synchronously on this very thread.
-    pending().lock().insert(id, tx);
+    pending().lock().insert(id, Answer::Paths(tx));
     handler(id, mode);
+    rx
+}
+
+/// Ask ArkTS to open a **save** picker (`DocumentViewPicker.save`). The wire
+/// reuses the pick channel: the mode string carries the payload after one
+/// [`SEPARATOR`] — `save` + dir + suggested name — and the answer comes back
+/// through [`deliver`] with the chosen file's path (empty = cancelled).
+pub fn prompt_save(
+    directory: &Path,
+    suggested_name: Option<&str>,
+) -> oneshot::Receiver<Result<Option<PathBuf>>> {
+    let (tx, rx) = oneshot::channel();
+    let handler = PROMPT.lock().clone();
+    let Some(handler) = handler else {
+        let _ = tx.send(Err(anyhow::anyhow!(
+            "no file picker is registered — call nativeSetFolderPicker from ArkTS; \
+             the NDK has no save dialog of its own"
+        )));
+        return rx;
+    };
+
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let payload = format!(
+        "save{sep}{}{sep}{}",
+        directory.display(),
+        suggested_name.unwrap_or(""),
+        sep = SEPARATOR
+    );
+    pending().lock().insert(id, Answer::Save(tx));
+    handler(id, &payload);
     rx
 }
 
@@ -119,16 +157,31 @@ pub fn deliver(id: u64, joined: &str) {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .collect();
-    log::info!("file_picker: id {id} resolved with {} path(s)", paths.len());
-    let _ = sender.send(Ok(if paths.is_empty() { None } else { Some(paths) }));
+    match sender {
+        Answer::Paths(sender) => {
+            log::info!("file_picker: id {id} resolved with {} path(s)", paths.len());
+            let _ = sender.send(Ok(if paths.is_empty() { None } else { Some(paths) }));
+        }
+        // 另存为只该拿到一个目标文件；多段是 ArkTS 侧的 bug，取第一段照实回。
+        Answer::Save(sender) => {
+            log::info!("file_picker: id {id} save resolved with {} path(s)", paths.len());
+            let _ = sender.send(Ok(paths.into_iter().next()));
+        }
+    }
 }
 
 /// The ArkTS side could not produce usable paths (a refused URI scheme, or the
 /// picker itself failed).
 pub fn fail(id: u64, reason: &str) {
-    let sender = pending().lock().remove(&id);
-    if let Some(sender) = sender {
-        let _ = sender.send(Err(anyhow::anyhow!("folder picker: {reason}")));
+    let answer = pending().lock().remove(&id);
+    match answer {
+        Some(Answer::Paths(sender)) => {
+            let _ = sender.send(Err(anyhow::anyhow!("folder picker: {reason}")));
+        }
+        Some(Answer::Save(sender)) => {
+            let _ = sender.send(Err(anyhow::anyhow!("save picker: {reason}")));
+        }
+        None => log::warn!("file_picker: no request pending for id {id}"),
     }
 }
 
