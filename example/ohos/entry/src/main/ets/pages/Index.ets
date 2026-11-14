@@ -1,4 +1,5 @@
 import native from 'libgpui_mobile_example.so';
+import inputMethod from '@ohos.inputMethod';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { registerFolderPicker } from '../common/folder_picker';
 
@@ -19,12 +20,28 @@ struct Index {
     // Register the software-keyboard bridge.  Native calls this with a
     // keyboard-type string to show the IME, or with no argument to hide it.
     //
-    // NOTE: driving the OHOS IME requires a focused TextInput / the
-    // `@ohos.inputMethod` API; that wiring is best-effort and currently just
-    // logs.  Hardware / XComponent key events already reach GPUI.
+    // The request is delivered through `@ohos.inputMethod`'s controller
+    // (`showTextInput` / `hideTextInput`).  Those operate on the currently
+    // focused TextInput, so on a page whose only surface is the GPUI
+    // XComponent they reject — the rejection is logged and the request is
+    // otherwise dropped (the keyboard-type string currently informs nothing
+    // on this path; the IME picks the layout from the focused component).
+    // GPUI's own text fields drive the IME through the NDK controller
+    // (`src/ohos/ime.rs`) and never come through here.  Hardware /
+    // XComponent key events reach GPUI regardless.
     try {
       native.nativeSetKeyboardCallback((kind?: string) => {
         hilog.info(DOMAIN, TAG, 'keyboard request: %{public}s', kind ?? 'hide');
+        const controller = inputMethod.getController();
+        if (kind === undefined) {
+          controller.hideTextInput().catch((err: Error) => {
+            hilog.warn(DOMAIN, TAG, 'hideTextInput: %{public}s', JSON.stringify(err));
+          });
+        } else {
+          controller.showTextInput().catch((err: Error) => {
+            hilog.warn(DOMAIN, TAG, 'showTextInput: %{public}s', JSON.stringify(err));
+          });
+        }
       });
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'nativeSetKeyboardCallback failed');

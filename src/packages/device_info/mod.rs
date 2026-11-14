@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_env = "ohos")]
+mod ohos;
 #[cfg(target_os = "ios")]
 mod ios;
 
@@ -30,8 +32,12 @@ pub fn get_device_info() -> Result<DeviceInfo, String> {
     {
         android::get_device_info()
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[cfg(target_env = "ohos")]
     {
-        Err("device_info is only available on iOS and Android".into())
+        ohos::get_device_info()
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
+    {
+        Err("device_info is only available on iOS, Android and OHOS".into())
     }
 }
