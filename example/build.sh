@@ -635,7 +635,11 @@ build_ohos() {
         "CC_${var}=$ohos_native/llvm/bin/clang" \
         "CFLAGS_${var}=--target=${ohos_triple} --sysroot=$ohos_native/sysroot" \
         "AR_${var}=$ohos_native/llvm/bin/llvm-ar" \
-        RUSTFLAGS="-Clinker=$ohos_native/llvm/bin/clang -Clink-arg=--target=${ohos_triple} -Clink-arg=--sysroot=$ohos_native/sysroot -Lnative=$ohos_native/sysroot/usr/lib/${ohos_triple}" \
+        # 链接器走 NDK 的 per-target 包装（自带 `--target` 与 `--sysroot`），并显式
+        # `-fuse-ld=lld`：裸 clang 的默认 ld 落到宿主 PATH 上，宿主 ld 吃不下
+        # aarch64 的目标文件（"Relocations in generic ELF (EM: 183)"）—— 模拟器
+        # 的 x86_64 产物能侥幸过，是因为宿主 ld 恰好同格式；真机这一档从未过过。
+        RUSTFLAGS="-Clinker=$ohos_native/llvm/bin/${rust_target}-clang -Clink-arg=-fuse-ld=lld -Lnative=$ohos_native/sysroot/usr/lib/${ohos_triple}" \
         cargo +nightly build \
         --target "$rust_target" \
         -Z build-std=std,panic_abort \

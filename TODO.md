@@ -4,10 +4,16 @@
   no ArkTS), and the clipboard bridges landed with the lifecycle batch. The core
   platform layer (rendering, touch input, lifecycle) is implemented and runs a live
   frame loop on the emulator.
-- HarmonyOS: validate the backend on a **physical device**. The x86_64 emulator is
-  validated end to end — links, installs, draws (instance data goes through the
-  texture transport because that driver has no SSBOs) — but a phone is a different
-  GLES stack, and nobody has run it there.
+- HarmonyOS: validate the backend on a **physical device**. The aarch64 link now
+  works (`build.sh` links through the NDK's per-target clang wrapper +
+  `-fuse-ld=lld`; the bare-clang path only ever worked for the x86_64 emulator
+  because the host `ld` happened to share the ELF format) and the cdylib links
+  end to end — but nothing has been installed or run on a phone. The HAP
+  assembly is currently blocked by two ArkTS API mismatches against the
+  command-line-tools SDK (`EntryAbility.ets` `getConfiguration`,
+  `folder_picker.ets` `DocumentSaveOptions.newFileUri`) that a full DevEco SDK
+  likely resolves — the same files compiled fine against the SDK they were
+  written against.
 - HarmonyOS: ship a bundled emoji font the way Android does. **Done** —
   `fonts/NotoColorEmoji.ttf` ships in the HAP's rawfile directory and is loaded
   through the rawfile NDK surface (`src/ohos/rawfile.rs`) as soon as ArkTS hands

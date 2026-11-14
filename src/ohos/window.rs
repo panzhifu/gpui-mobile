@@ -54,7 +54,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use super::{OhosKeyEvent, Pixels, Size, TouchPoint};
-use crate::momentum::{MomentumScroller, VelocityTracker};
+use crate::fling_guard::FlingGuard;
+use crate::pinch_guard::PinchGuard;
 
 /// The default preferred present mode for the OHOS GLES surface.
 ///
@@ -131,25 +132,6 @@ impl HasDisplayHandle for OhosNativeWindow {
         // SAFETY: the OHOS display handle borrows no data.
         Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(raw) })
     }
-}
-
-// ── momentum state ────────────────────────────────────────────────────────────
-
-/// Shared momentum scrolling state, accessible from both the touch callback
-/// (which starts/cancels flings and records velocity samples) and the
-/// request-frame callback (which pumps the decelerating animation).
-///
-/// As on Android, touch MOVE events **accumulate** a scroll delta which is
-/// drained once per frame, avoiding a full layout+paint per move event.
-struct MomentumState {
-    velocity_tracker: VelocityTracker,
-    scroller: MomentumScroller,
-    pending_scroll_dx: f32,
-    pending_scroll_dy: f32,
-    pending_scroll_pos_x: f32,
-    pending_scroll_pos_y: f32,
-    has_pending_scroll: bool,
-    pending_scroll_phase: gpui::TouchPhase,
 }
 
 // ── callback type aliases ─────────────────────────────────────────────────────
@@ -816,8 +798,8 @@ pub struct OhosPlatformWindow {
     display: Option<Rc<dyn PlatformDisplay>>,
     input_handler: Rc<RefCell<Option<PlatformInputHandler>>>,
     title: String,
-    momentum: Arc<Mutex<MomentumState>>,
-    momentum_input_cb:
+    /// IME 的按键合成事件派回 gpui 的那根管（`ime.rs` 的订阅方）。
+    ime_input_callback:
         Arc<Mutex<Box<dyn FnMut(gpui::PlatformInput) -> DispatchEventResult + Send>>>,
 }
 
@@ -831,17 +813,7 @@ impl OhosPlatformWindow {
             display,
             input_handler: Rc::new(RefCell::new(None)),
             title: String::new(),
-            momentum: Arc::new(Mutex::new(MomentumState {
-                velocity_tracker: VelocityTracker::new(),
-                scroller: MomentumScroller::new(),
-                pending_scroll_dx: 0.0,
-                pending_scroll_dy: 0.0,
-                pending_scroll_pos_x: 0.0,
-                pending_scroll_pos_y: 0.0,
-                has_pending_scroll: false,
-                pending_scroll_phase: gpui::TouchPhase::Moved,
-            })),
-            momentum_input_cb: Arc::new(Mutex::new(noop_input_cb)),
+            ime_input_callback: Arc::new(Mutex::new(noop_input_cb)),
         }
     }
 
@@ -940,7 +912,7 @@ impl PlatformWindow for OhosPlatformWindow {
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         *self.input_handler.borrow_mut() = Some(input_handler);
-        super::ime::attach(self.input_handler.clone(), self.momentum_input_cb.clone());
+        super::ime::attach(self.input_handler.clone(), self.ime_input_callback.clone());
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
@@ -1007,98 +979,12 @@ impl PlatformWindow for OhosPlatformWindow {
             unsafe { std::mem::transmute(callback) };
         let send_callback = Mutex::new(send_callback);
 
-        let momentum = Arc::clone(&self.momentum);
-        let input_cb = Arc::clone(&self.momentum_input_cb);
-
         self.window.on_request_frame(move || {
-            // 1. Drain coalesced touch-scroll deltas (at most one ScrollWheel/frame).
-            {
-                let mut ms = momentum.lock();
-
-                if ms.has_pending_scroll {
-                    let dx = ms.pending_scroll_dx;
-                    let dy = ms.pending_scroll_dy;
-                    let pos_x = ms.pending_scroll_pos_x;
-                    let pos_y = ms.pending_scroll_pos_y;
-                    let phase = ms.pending_scroll_phase;
-
-                    ms.pending_scroll_dx = 0.0;
-                    ms.pending_scroll_dy = 0.0;
-                    ms.has_pending_scroll = false;
-                    drop(ms);
-
-                    let position = gpui::point(gpui::px(pos_x), gpui::px(pos_y));
-                    if let Some(mut guard) = input_cb.try_lock() {
-                        let _ = guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
-                            position,
-                            delta: gpui::ScrollDelta::Pixels(gpui::point(
-                                gpui::px(dx),
-                                gpui::px(dy),
-                            )),
-                            modifiers: gpui::Modifiers::default(),
-                            touch_phase: phase,
-                            source: gpui::ScrollSource::Touch,
-                        }));
-                    }
-                } else if ms.scroller.is_active() {
-                    // 2. Momentum scrolling pump.
-                    if let Some(delta) = ms.scroller.step() {
-                        let position =
-                            gpui::point(gpui::px(delta.position_x), gpui::px(delta.position_y));
-                        let fling_ended = !ms.scroller.is_active();
-                        drop(ms);
-
-                        if let Some(mut guard) = input_cb.try_lock() {
-                            let _ =
-                                guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
-                                    position,
-                                    delta: gpui::ScrollDelta::Pixels(gpui::point(
-                                        gpui::px(delta.dx),
-                                        gpui::px(delta.dy),
-                                    )),
-                                    modifiers: gpui::Modifiers::default(),
-                                    touch_phase: gpui::TouchPhase::Moved,
-                                    source: gpui::ScrollSource::Touch,
-                                }));
-                            if fling_ended {
-                                let _ = guard(gpui::PlatformInput::Scroll(
-                                    gpui::ScrollEvent {
-                                        position,
-                                        delta: gpui::ScrollDelta::Pixels(gpui::point(
-                                            gpui::px(0.0),
-                                            gpui::px(0.0),
-                                        )),
-                                        modifiers: gpui::Modifiers::default(),
-                                        touch_phase: gpui::TouchPhase::Ended,
-                                        source: gpui::ScrollSource::Touch,
-                                    },
-                                ));
-                            }
-                        }
-                    } else {
-                        let pos = gpui::point(
-                            gpui::px(ms.scroller.position_x()),
-                            gpui::px(ms.scroller.position_y()),
-                        );
-                        drop(ms);
-                        if let Some(mut guard) = input_cb.try_lock() {
-                            let _ =
-                                guard(gpui::PlatformInput::Scroll(gpui::ScrollEvent {
-                                    position: pos,
-                                    delta: gpui::ScrollDelta::Pixels(gpui::point(
-                                        gpui::px(0.0),
-                                        gpui::px(0.0),
-                                    )),
-                                    modifiers: gpui::Modifiers::default(),
-                                    touch_phase: gpui::TouchPhase::Ended,
-                                    source: gpui::ScrollSource::Touch,
-                                }));
-                        }
-                    }
-                }
-            }
-
-            // 3. Force a render if text input arrived since the last frame.
+            // Scroll coalescing and fling momentum used to be pumped in this
+            // frame callback; both now live in GPUI's touch gesture recognizer,
+            // since this arm switched to `PlatformInput::Touch` (see `on_input`).
+            //
+            // Force a render if text input arrived since the last frame.
             let text_dirty =
                 crate::TEXT_INPUT_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
 
@@ -1121,178 +1007,74 @@ impl PlatformWindow for OhosPlatformWindow {
             unsafe { std::mem::transmute(callback) };
         let input_cb = Arc::new(Mutex::new(send_callback));
 
-        *self.momentum_input_cb.lock() = {
+        *self.ime_input_callback.lock() = {
             let cb = Arc::clone(&input_cb);
             Box::new(move |input: gpui::PlatformInput| -> DispatchEventResult { cb.lock()(input) })
         };
 
-        // ── Touch events → PlatformInput ─────────────────────────────────
+        // ── Touch events → real `gpui::TouchEvent` ─────────────────────────
+        //
+        // The hand-rolled path that used to live here — touch mapped to
+        // synthesized mouse events, plus its own velocity tracker, scroll
+        // coalescing and fling momentum — is gone. GPUI's touch gesture
+        // recognizer (`gpui-pre` `gestures.rs`) recognizes taps — with
+        // accumulating click counts, so double-tap gestures finally fire on
+        // OHOS — pans, touch drags and post-release fling momentum from plain
+        // `PlatformInput::Touch` events, exactly as the Android arm already
+        // does. `PinchGuard` sits in front so two contacts become a pinch
+        // rather than a second pan, and `FlingGuard` keeps a contact that
+        // stops a fling from inheriting its axis.
         {
             let cb = Arc::clone(&input_cb);
-            let scale_factor = self.window.scale_factor();
-            let momentum = Arc::clone(&self.momentum);
-
-            const SCROLL_SLOP: f32 = 8.0;
-
-            #[derive(Clone, Copy, Debug)]
-            enum TouchState {
-                Idle,
-                Pending { start_x: f32, start_y: f32 },
-                Scrolling { prev_x: f32, prev_y: f32 },
-            }
-
-            let state = Mutex::new(TouchState::Idle);
-
+            let window = Arc::downgrade(&self.window);
+            let mut next_id = 0u64;
+            let mut next_touch_id = move || {
+                let id = gpui::TouchId(next_id);
+                next_id = next_id.checked_add(1).expect("touch ID exhausted");
+                id
+            };
+            let mut active_touches = HashMap::new();
+            let mut fling_guard = FlingGuard::new();
+            let mut pinch_guard = PinchGuard::new();
             self.window.on_touch(move |touch| {
-                // OHOS delivers touch coordinates in surface (device) pixels;
-                // GPUI lays out in logical pixels.
-                let logical_x = touch.x / scale_factor;
-                let logical_y = touch.y / scale_factor;
-                let modifiers = gpui::Modifiers::default();
-
-                let mut ts = state.lock();
-
-                match touch.action {
-                    // DOWN
-                    0 => {
-                        {
-                            let mut ms = momentum.lock();
-                            ms.scroller.cancel();
-                            ms.velocity_tracker.reset();
-                            ms.pending_scroll_dx = 0.0;
-                            ms.pending_scroll_dy = 0.0;
-                            ms.has_pending_scroll = false;
-                        }
-                        *ts = TouchState::Pending {
-                            start_x: logical_x,
-                            start_y: logical_y,
-                        };
-                    }
-
-                    // MOVE
-                    2 => {
-                        let mut ms = momentum.lock();
-                        ms.velocity_tracker.record(logical_x, logical_y);
-
-                        match *ts {
-                            TouchState::Pending { start_x, start_y } => {
-                                let dx = logical_x - start_x;
-                                let dy = logical_y - start_y;
-                                let distance = (dx * dx + dy * dy).sqrt();
-                                if distance > SCROLL_SLOP {
-                                    *ts = TouchState::Scrolling {
-                                        prev_x: logical_x,
-                                        prev_y: logical_y,
-                                    };
-                                    ms.pending_scroll_dx += dx;
-                                    ms.pending_scroll_dy += dy;
-                                    ms.pending_scroll_pos_x = logical_x;
-                                    ms.pending_scroll_pos_y = logical_y;
-                                    if !ms.has_pending_scroll {
-                                        ms.pending_scroll_phase = gpui::TouchPhase::Started;
-                                    }
-                                    ms.has_pending_scroll = true;
-                                }
-                            }
-                            TouchState::Scrolling { prev_x, prev_y } => {
-                                let dx = logical_x - prev_x;
-                                let dy = logical_y - prev_y;
-                                *ts = TouchState::Scrolling {
-                                    prev_x: logical_x,
-                                    prev_y: logical_y,
-                                };
-                                ms.pending_scroll_dx += dx;
-                                ms.pending_scroll_dy += dy;
-                                ms.pending_scroll_pos_x = logical_x;
-                                ms.pending_scroll_pos_y = logical_y;
-                                if !ms.has_pending_scroll {
-                                    ms.pending_scroll_phase = gpui::TouchPhase::Moved;
-                                }
-                                ms.has_pending_scroll = true;
-                            }
-                            TouchState::Idle => {}
-                        }
-                        drop(ms);
-
-                        let position = gpui::point(gpui::px(logical_x), gpui::px(logical_y));
-                        let mut guard = cb.lock();
-                        let _ = guard(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
-                            position,
-                            modifiers,
-                            pressed_button: Some(gpui::MouseButton::Left),
-                        }));
-                    }
-
-                    // UP / CANCEL
-                    1 | 3 => {
-                        let position = gpui::point(gpui::px(logical_x), gpui::px(logical_y));
-
-                        match *ts {
-                            TouchState::Pending { start_x, start_y } => {
-                                {
-                                    let mut ms = momentum.lock();
-                                    ms.velocity_tracker.reset();
-                                    ms.has_pending_scroll = false;
-                                }
-                                let tap_pos = gpui::point(gpui::px(start_x), gpui::px(start_y));
-                                let mut guard = cb.lock();
-                                let _ =
-                                    guard(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
-                                        button: gpui::MouseButton::Left,
-                                        position: tap_pos,
-                                        modifiers,
-                                        click_count: 1,
-                                        first_mouse: false,
-                                    }));
-                                let _ = guard(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
-                                    button: gpui::MouseButton::Left,
-                                    position: tap_pos,
-                                    modifiers,
-                                    click_count: 1,
-                                }));
-                            }
-                            TouchState::Scrolling { prev_x, prev_y } => {
-                                let dx = logical_x - prev_x;
-                                let dy = logical_y - prev_y;
-                                let mut ms = momentum.lock();
-
-                                let total_dx = ms.pending_scroll_dx + dx;
-                                let total_dy = ms.pending_scroll_dy + dy;
-                                ms.pending_scroll_dx = 0.0;
-                                ms.pending_scroll_dy = 0.0;
-                                ms.has_pending_scroll = false;
-
-                                let (vx, vy) = ms.velocity_tracker.velocity();
-                                ms.velocity_tracker.reset();
-                                ms.scroller.fling(vx, vy, logical_x, logical_y);
-                                drop(ms);
-
-                                let mut guard = cb.lock();
-                                let _ = guard(gpui::PlatformInput::Scroll(
-                                    gpui::ScrollEvent {
-                                        position,
-                                        delta: gpui::ScrollDelta::Pixels(gpui::point(
-                                            gpui::px(total_dx),
-                                            gpui::px(total_dy),
-                                        )),
-                                        modifiers,
-                                        touch_phase: gpui::TouchPhase::Ended,
-                                        source: gpui::ScrollSource::Touch,
-                                    },
-                                ));
-                                let _ = guard(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
-                                    button: gpui::MouseButton::Left,
-                                    position,
-                                    modifiers,
-                                    click_count: 1,
-                                }));
-                            }
-                            TouchState::Idle => {}
-                        }
-                        *ts = TouchState::Idle;
-                    }
-
-                    _ => {}
+                let phase = match touch.action {
+                    0 => gpui::TouchPhase::Started,
+                    1 => gpui::TouchPhase::Ended,
+                    2 => gpui::TouchPhase::Moved,
+                    3 => gpui::TouchPhase::Cancelled,
+                    _ => return,
+                };
+                let id = if phase == gpui::TouchPhase::Started {
+                    // XComponent contact IDs are reused after release; give
+                    // GPUI a stable one for the gesture recognizer.
+                    let id = next_touch_id();
+                    active_touches.insert(touch.id, id);
+                    id
+                } else {
+                    let Some(id) = active_touches.get(&touch.id).copied() else {
+                        return;
+                    };
+                    id
+                };
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                let scale = window.scale_factor();
+                let event = gpui::TouchEvent {
+                    id,
+                    phase,
+                    // OHOS delivers touch coordinates in surface (device)
+                    // pixels; GPUI lays out in logical pixels.
+                    position: gpui::point(gpui::px(touch.x / scale), gpui::px(touch.y / scale)),
+                    predicted_position: None,
+                    force: None,
+                };
+                let mut cb = cb.lock();
+                pinch_guard.relay(event, &mut fling_guard, &mut next_touch_id, &mut |input| {
+                    cb(input);
+                });
+                if matches!(phase, gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled) {
+                    active_touches.remove(&touch.id);
                 }
             });
         }
