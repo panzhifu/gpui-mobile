@@ -42,10 +42,11 @@
 
 use parking_lot::Mutex;
 use std::ffi::{c_char, c_double, c_int, c_void, CStr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use gpui::{App, Application};
+use gpui::{App, AppLifecyclePhase, Application, WindowAppearance};
 
 use super::platform::{self, OhosPlatform, SharedPlatform};
 use super::window::OhosNativeWindow;
@@ -107,6 +108,36 @@ extern "C" {
     ) -> NapiStatus;
     fn napi_unwrap(env: NapiEnv, js_object: NapiValue, result: *mut *mut c_void) -> NapiStatus;
     fn napi_get_value_double(env: NapiEnv, value: NapiValue, result: *mut c_double) -> NapiStatus;
+    fn napi_get_value_string_utf8(
+        env: NapiEnv,
+        value: NapiValue,
+        buf: *mut c_char,
+        buflen: usize,
+        result: *mut usize,
+    ) -> NapiStatus;
+    fn napi_create_int32(env: NapiEnv, value: c_int, result: *mut NapiValue) -> NapiStatus;
+    fn napi_create_double(env: NapiEnv, value: c_double, result: *mut NapiValue) -> NapiStatus;
+    fn napi_get_value_bool(env: NapiEnv, value: NapiValue, result: *mut bool) -> NapiStatus;
+    fn napi_get_array_length(env: NapiEnv, value: NapiValue, result: *mut u32) -> NapiStatus;
+    fn napi_get_element(
+        env: NapiEnv,
+        object: NapiValue,
+        index: u32,
+        result: *mut NapiValue,
+    ) -> NapiStatus;
+    fn napi_get_boolean(env: NapiEnv, value: bool, result: *mut NapiValue) -> NapiStatus;
+    fn napi_get_null(env: NapiEnv, result: *mut NapiValue) -> NapiStatus;
+    fn napi_create_array_with_length(
+        env: NapiEnv,
+        length: usize,
+        result: *mut NapiValue,
+    ) -> NapiStatus;
+    fn napi_set_element(
+        env: NapiEnv,
+        object: NapiValue,
+        index: u32,
+        value: NapiValue,
+    ) -> NapiStatus;
     fn napi_get_undefined(env: NapiEnv, result: *mut NapiValue) -> NapiStatus;
     fn napi_create_string_utf8(
         env: NapiEnv,
@@ -138,6 +169,10 @@ extern "C" {
 
 /// `napi_valuetype::napi_function`.
 const NAPI_FUNCTION: c_int = 6;
+/// `napi_valuetype::napi_null`.
+const NAPI_NULL: c_int = 1;
+/// `napi_valuetype::napi_undefined`.
+const NAPI_UNDEFINED: c_int = 0;
 
 // ── NapiModule ────────────────────────────────────────────────────────────────
 
@@ -220,6 +255,10 @@ static PLATFORM: OnceLock<Arc<OhosPlatform>> = OnceLock::new();
 static APP_CB: Mutex<Option<Box<dyn FnOnce(&mut App) + Send>>> = Mutex::new(None);
 static NAPI_ENV: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static KEYBOARD_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static CLIPBOARD_WRITE_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static OPEN_URL_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static PICK_PATHS_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static CREDENTIAL_REF: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Returns the global platform singleton.
 ///
@@ -262,6 +301,9 @@ pub unsafe fn install(
     // 1. Register the plain NAPI functions ArkTS calls directly.
     register_function(env, exports, c"nativeInit", native_init);
     register_function(env, exports, c"nativeSetDensity", native_set_density);
+    register_function(env, exports, c"nativeLifecycle", native_lifecycle);
+    register_function(env, exports, c"nativeMemoryWarning", native_memory_warning);
+    register_function(env, exports, c"nativeSetAppearance", native_set_appearance);
     register_function(
         env,
         exports,
@@ -277,6 +319,58 @@ pub unsafe fn install(
         c"nativeSetKeyboardCallback",
         native_set_keyboard_callback,
     );
+    register_function(env, exports, c"nativeSubmitText", native_submit_text);
+    register_function(env, exports, c"nativeKeyEvent", native_key_event);
+    register_function(
+        env,
+        exports,
+        c"nativeSetClipboardCallback",
+        native_set_clipboard_callback,
+    );
+    register_function(
+        env,
+        exports,
+        c"nativeClipboardChanged",
+        native_clipboard_changed,
+    );
+    register_function(
+        env,
+        exports,
+        c"nativeTakeSystemChrome",
+        native_take_system_chrome,
+    );
+    register_function(
+        env,
+        exports,
+        c"nativeSystemChromeGeneration",
+        native_system_chrome_generation,
+    );
+    register_function(
+        env,
+        exports,
+        c"nativeSetKeyboardHeight",
+        native_set_keyboard_height,
+    );
+    register_function(
+        env,
+        exports,
+        c"nativeSetOpenUrlCallback",
+        native_set_open_url_callback,
+    );
+    register_function(
+        env,
+        exports,
+        c"nativeSetPickPathsCallback",
+        native_set_pick_paths_callback,
+    );
+    register_function(env, exports, c"nativePickerResult", native_picker_result);
+    register_function(
+        env,
+        exports,
+        c"nativeSetCredentialCallback",
+        native_set_credential_callback,
+    );
+    register_function(env, exports, c"nativeOpenUrls", native_open_urls);
 
     // 2. Create the platform singleton and start the (non-blocking) GPUI app.
     let platform = PLATFORM
@@ -504,6 +598,133 @@ fn arg_f64(env: NapiEnv, value: NapiValue) -> Option<f64> {
     (unsafe { napi_get_value_double(env, value, &mut v as *mut _) } == NAPI_OK).then_some(v)
 }
 
+/// Read a JS string argument.  `None` for non-string values.
+fn arg_string(env: NapiEnv, value: NapiValue) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    // First query the byte length, then read into a buffer of that size.
+    let mut len: usize = 0;
+    if unsafe { napi_get_value_string_utf8(env, value, std::ptr::null_mut(), 0, &mut len) }
+        != NAPI_OK
+    {
+        return None;
+    }
+    let mut buf = vec![0u8; len + 1];
+    let mut written: usize = 0;
+    if unsafe {
+        napi_get_value_string_utf8(
+            env,
+            value,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len(),
+            &mut written,
+        )
+    } != NAPI_OK
+    {
+        return None;
+    }
+    buf.truncate(written);
+    String::from_utf8(buf).ok()
+}
+
+fn arg_bool(env: NapiEnv, value: NapiValue) -> Option<bool> {
+    if value.is_null() {
+        return None;
+    }
+    let mut v = false;
+    (unsafe { napi_get_value_bool(env, value, &mut v as *mut _) } == NAPI_OK).then_some(v)
+}
+
+fn arg_string_array(env: NapiEnv, value: NapiValue) -> Option<Vec<String>> {
+    if value.is_null() {
+        return None;
+    }
+    let mut len = 0u32;
+    if unsafe { napi_get_array_length(env, value, &mut len as *mut _) } != NAPI_OK {
+        return None;
+    }
+    let mut result = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let mut item = std::ptr::null_mut();
+        if unsafe { napi_get_element(env, value, i, &mut item as *mut _) } != NAPI_OK {
+            return None;
+        }
+        result.push(arg_string(env, item)?);
+    }
+    Some(result)
+}
+
+fn store_function_ref(env: NapiEnv, value: NapiValue) -> Option<NapiRef> {
+    let mut ty: c_int = 0;
+    if unsafe { napi_typeof(env, value, &mut ty as *mut _) } != NAPI_OK || ty != NAPI_FUNCTION {
+        log::warn!("callback argument is not a function");
+        return None;
+    }
+    let mut reference: NapiRef = std::ptr::null_mut();
+    if unsafe { napi_create_reference(env, value, 1, &mut reference as *mut _) } != NAPI_OK {
+        log::warn!("napi_create_reference failed");
+        return None;
+    }
+    Some(reference)
+}
+
+fn call_function(env: NapiEnv, reference: NapiRef, args: &[NapiValue]) -> Option<NapiValue> {
+    if env.is_null() || reference.is_null() {
+        return None;
+    }
+    let mut func: NapiValue = std::ptr::null_mut();
+    if unsafe { napi_get_reference_value(env, reference, &mut func as *mut _) } != NAPI_OK
+        || func.is_null()
+    {
+        return None;
+    }
+    let mut result: NapiValue = std::ptr::null_mut();
+    let status = unsafe {
+        napi_call_function(
+            env,
+            undefined(env),
+            func,
+            args.len(),
+            args.as_ptr(),
+            &mut result as *mut _,
+        )
+    };
+    (status == NAPI_OK).then_some(result)
+}
+
+fn string_value(env: NapiEnv, value: &str) -> Option<NapiValue> {
+    let c_value = std::ffi::CString::new(value).ok()?;
+    let mut result: NapiValue = std::ptr::null_mut();
+    (unsafe { napi_create_string_utf8(env, c_value.as_ptr(), value.len(), &mut result as *mut _) }
+        == NAPI_OK)
+        .then_some(result)
+}
+
+fn bool_value(env: NapiEnv, value: bool) -> NapiValue {
+    let mut v: NapiValue = std::ptr::null_mut();
+    unsafe { napi_get_boolean(env, value, &mut v as *mut _) };
+    v
+}
+
+fn null_value(env: NapiEnv) -> NapiValue {
+    let mut v: NapiValue = std::ptr::null_mut();
+    unsafe { napi_get_null(env, &mut v as *mut _) };
+    v
+}
+
+fn int32(env: NapiEnv, value: c_int) -> NapiValue {
+    let mut v: NapiValue = std::ptr::null_mut();
+    unsafe { napi_create_int32(env, value, &mut v as *mut _) };
+    v
+}
+
+fn double(env: NapiEnv, value: f64) -> NapiValue {
+    let mut v: NapiValue = std::ptr::null_mut();
+    unsafe { napi_create_double(env, value, &mut v as *mut _) };
+    v
+}
+
 fn undefined(env: NapiEnv) -> NapiValue {
     let mut v: NapiValue = std::ptr::null_mut();
     unsafe { napi_get_undefined(env, &mut v as *mut _) };
@@ -524,7 +745,55 @@ extern "C" fn native_set_density(env: NapiEnv, info: NapiCallbackInfo) -> NapiVa
     if argc >= 1 {
         if let Some(scale) = arg_f64(env, argv[0]) {
             super::set_density(scale as f32);
+            if let Some(p) = try_platform() {
+                p.apply_density(scale as f32);
+                p.refresh_insets();
+            }
             log::info!("napi: density set to {scale:.2}");
+        }
+    }
+    undefined(env)
+}
+
+/// `nativeLifecycle(phase)` — 0=Active, 1=Inactive, 2=Background, 3=Foreground.
+extern "C" fn native_lifecycle(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc >= 1 {
+        let phase = match arg_f64(env, argv[0]).unwrap_or(2.0) as i32 {
+            0 => AppLifecyclePhase::Active,
+            1 => AppLifecyclePhase::Inactive,
+            3 => AppLifecyclePhase::Foreground,
+            _ => AppLifecyclePhase::Background,
+        };
+        if let Some(p) = try_platform() {
+            p.deliver_lifecycle(phase);
+        }
+    }
+    undefined(env)
+}
+
+/// `nativeMemoryWarning()` — ArkTS `onMemoryLevel` observed pressure.
+extern "C" fn native_memory_warning(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    if let Some(p) = try_platform() {
+        p.deliver_memory_warning();
+    }
+    undefined(env)
+}
+
+/// `nativeSetAppearance(mode)` — 0=light, 1=dark, 2=vibrant light, 3=vibrant dark.
+extern "C" fn native_set_appearance(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc >= 1 {
+        let mode = arg_f64(env, argv[0]).unwrap_or(0.0) as i32;
+        let appearance = match mode {
+            1 => WindowAppearance::Dark,
+            2 => WindowAppearance::VibrantLight,
+            3 => WindowAppearance::VibrantDark,
+            _ => WindowAppearance::Light,
+        };
+        super::set_appearance_mode(mode.clamp(0, 3) as u32);
+        if let Some(p) = try_platform() {
+            p.set_appearance(appearance);
         }
     }
     undefined(env)
@@ -539,6 +808,18 @@ extern "C" fn native_set_safe_area_insets(env: NapiEnv, info: NapiCallbackInfo) 
         let left = arg_f64(env, argv[2]).unwrap_or(0.0) as f32;
         let right = arg_f64(env, argv[3]).unwrap_or(0.0) as f32;
         super::set_safe_area_insets(top, bottom, left, right);
+        if let Some(p) = try_platform() {
+            if let Some(win) = p.primary_window() {
+                let scale = super::density().max(0.001);
+                win.set_safe_area_insets(super::window::SafeAreaInsets {
+                    top: top * scale,
+                    bottom: bottom * scale,
+                    left: left * scale,
+                    right: right * scale,
+                });
+            }
+            p.refresh_insets();
+        }
         log::info!("napi: safe area insets {top}/{bottom}/{left}/{right}");
     }
     undefined(env)
@@ -548,6 +829,8 @@ extern "C" fn native_on_foreground(env: NapiEnv, _info: NapiCallbackInfo) -> Nap
     log::info!("napi: onForeground");
     if let Some(p) = try_platform() {
         p.did_become_active();
+        p.deliver_lifecycle(AppLifecyclePhase::Foreground);
+        p.deliver_lifecycle(AppLifecyclePhase::Active);
         if let Some(w) = p.primary_window() {
             w.set_active(true);
         }
@@ -559,6 +842,8 @@ extern "C" fn native_on_background(env: NapiEnv, _info: NapiCallbackInfo) -> Nap
     log::info!("napi: onBackground");
     if let Some(p) = try_platform() {
         p.did_enter_background();
+        p.deliver_lifecycle(AppLifecyclePhase::Inactive);
+        p.deliver_lifecycle(AppLifecyclePhase::Background);
         if let Some(w) = p.primary_window() {
             w.set_active(false);
         }
@@ -570,6 +855,9 @@ extern "C" fn native_on_destroy(env: NapiEnv, _info: NapiCallbackInfo) -> NapiVa
     log::info!("napi: onDestroy");
     vsync::stop();
     if let Some(p) = try_platform() {
+        if let Some(win) = p.primary_window() {
+            win.notify_close();
+        }
         p.quit();
     }
     undefined(env)
@@ -653,4 +941,371 @@ fn keyboard_type_name(k: crate::KeyboardType) -> &'static str {
         crate::KeyboardType::URL => "url",
         crate::KeyboardType::Decimal => "decimal",
     }
+}
+
+// ── ArkTS → native clipboard ──────────────────────────────────────────────────
+
+/// `nativeSetClipboardCallback(fn)` — ArkTS provides a function that writes a
+/// string to the system pasteboard when GPUI calls `write_to_clipboard`.
+extern "C" fn native_set_clipboard_callback(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let value = argv[0];
+    let mut ty: c_int = 0;
+    if unsafe { napi_typeof(env, value, &mut ty as *mut _) } != NAPI_OK || ty != NAPI_FUNCTION {
+        log::warn!("nativeSetClipboardCallback: argument is not a function");
+        return undefined(env);
+    }
+    let mut reference: NapiRef = std::ptr::null_mut();
+    if unsafe { napi_create_reference(env, value, 1, &mut reference as *mut _) } != NAPI_OK {
+        log::warn!("nativeSetClipboardCallback: napi_create_reference failed");
+        return undefined(env);
+    }
+    CLIPBOARD_WRITE_REF.store(reference, Ordering::Release);
+    platform::set_clipboard_write_handler(Box::new(call_clipboard_write_callback));
+    log::info!("napi: clipboard callback registered");
+    undefined(env)
+}
+
+fn call_clipboard_write_callback(text: &str) {
+    let env = NAPI_ENV.load(Ordering::Acquire);
+    let reference = CLIPBOARD_WRITE_REF.load(Ordering::Acquire);
+    if env.is_null() || reference.is_null() {
+        return;
+    }
+    let mut func: NapiValue = std::ptr::null_mut();
+    if unsafe { napi_get_reference_value(env, reference, &mut func as *mut _) } != NAPI_OK
+        || func.is_null()
+    {
+        return;
+    }
+    let c_text = match std::ffi::CString::new(text) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let mut arg: NapiValue = std::ptr::null_mut();
+    if unsafe { napi_create_string_utf8(env, c_text.as_ptr(), text.len(), &mut arg as *mut _) }
+        != NAPI_OK
+    {
+        return;
+    }
+    let this = undefined(env);
+    let mut result: NapiValue = std::ptr::null_mut();
+    let argv = [arg];
+    unsafe { napi_call_function(env, this, func, 1, argv.as_ptr(), &mut result as *mut _) };
+}
+
+/// `nativeClipboardChanged(text)` — ArkTS reports the current system pasteboard
+/// text (best-effort, called when the app regains focus).
+extern "C" fn native_clipboard_changed(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc >= 1 {
+        if let Some(text) = arg_string(env, argv[0]) {
+            if let Some(p) = try_platform() {
+                p.clipboard_changed(text);
+            }
+        }
+    }
+    undefined(env)
+}
+
+// ── ArkTS → native text input / system chrome ────────────────────────────────
+
+/// `nativeSubmitText(text)` — ArkTS IME delivered committed text or an editing
+/// key sequence (`"\x08"`, `"\x1b[D"`, ...).  Routed through the same
+/// `dispatch_text_input` path Android and iOS use.
+extern "C" fn native_submit_text(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc >= 1 {
+        if let Some(text) = arg_string(env, argv[0]) {
+            if !text.is_empty() {
+                crate::dispatch_text_input(&text);
+            }
+        }
+    }
+    undefined(env)
+}
+
+/// `nativeKeyEvent(key, modifiers)` — ArkTS delivered a hardware/IME editing
+/// key that must reach GPUI as a `KeyDown`/`KeyUp` event.
+///
+/// `key` uses GPUI key names (`"enter"`, `"backspace"`, `"escape"`, `"tab"`,
+/// `"up"`, ...).  `modifiers` is a bitmask: 1 = shift, 2 = control, 4 = alt,
+/// 8 = platform/meta, 16 = function.
+extern "C" fn native_key_event(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<2>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let Some(key) = arg_string(env, argv[0]) else {
+        return undefined(env);
+    };
+    let Some(key_code) = gpui_key_name_to_ohos(&key) else {
+        log::warn!("nativeKeyEvent: unsupported key name {key:?}");
+        return undefined(env);
+    };
+    let bits = if argc >= 2 {
+        arg_f64(env, argv[1]).unwrap_or(0.0) as u32
+    } else {
+        0
+    };
+    let meta_state = (if bits & 1 != 0 {
+        super::keyboard::OHOS_META_SHIFT_ON
+    } else {
+        0
+    }) | (if bits & 2 != 0 {
+        super::keyboard::OHOS_META_CTRL_ON
+    } else {
+        0
+    }) | (if bits & 4 != 0 {
+        super::keyboard::OHOS_META_ALT_ON
+    } else {
+        0
+    }) | (if bits & 8 != 0 {
+        super::keyboard::OHOS_META_META_ON
+    } else {
+        0
+    }) | (if bits & 16 != 0 {
+        super::keyboard::OHOS_META_FUNCTION_ON
+    } else {
+        0
+    });
+    let Some(win) = try_platform().and_then(|p| p.primary_window()) else {
+        return undefined(env);
+    };
+    win.handle_key_event(super::OhosKeyEvent {
+        key_code,
+        action: super::keyboard::KEY_ACTION_DOWN,
+        meta_state,
+        unicode_char: 0,
+    });
+    undefined(env)
+}
+
+/// Map a GPUI key name (as sent from ArkTS) to an OHOS `KeyCode`.
+fn gpui_key_name_to_ohos(key: &str) -> Option<i32> {
+    use super::keyboard::*;
+    Some(match key {
+        "enter" => KEY_ENTER,
+        "backspace" => KEY_DEL,
+        "delete" => KEY_FORWARD_DEL,
+        "escape" => KEY_ESCAPE,
+        "tab" => KEY_TAB,
+        "space" => KEY_SPACE,
+        "up" => KEY_DPAD_UP,
+        "down" => KEY_DPAD_DOWN,
+        "left" => KEY_DPAD_LEFT,
+        "right" => KEY_DPAD_RIGHT,
+        "home" => KEY_MOVE_HOME,
+        "end" => KEY_MOVE_END,
+        "pageup" => KEY_PAGE_UP,
+        "pagedown" => KEY_PAGE_DOWN,
+        "insert" => KEY_INSERT,
+        _ => return None,
+    })
+}
+
+/// `nativeTakeSystemChrome()` — ArkTS polls this after each `nativeInit` /
+/// foreground transition.  Returns `null` while no style has been requested,
+/// otherwise `[statusColor, lightIcons, navColor]`.  `null` colour slots mean
+/// "leave the system default"; using an `i32` here would truncate 24-bit
+/// colours with high bits set into a negative sentinel.
+extern "C" fn native_take_system_chrome(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    let status = super::status_bar_color();
+    let nav = super::navigation_bar_color();
+    if status.is_none() && nav.is_none() && !super::status_bar_is_light() {
+        return null_value(env);
+    }
+    let light = super::status_bar_is_light();
+    let values = [
+        status.map_or_else(|| null_value(env), |c| double(env, c as f64)),
+        bool_value(env, light),
+        nav.map_or_else(|| null_value(env), |c| double(env, c as f64)),
+    ];
+    let mut array: NapiValue = std::ptr::null_mut();
+    if unsafe { napi_create_array_with_length(env, values.len(), &mut array as *mut _) } != NAPI_OK
+    {
+        return undefined(env);
+    }
+    for (i, value) in values.into_iter().enumerate() {
+        if unsafe { napi_set_element(env, array, i as u32, value) } != NAPI_OK {
+            return undefined(env);
+        }
+    }
+    array
+}
+
+/// `nativeSystemChromeGeneration()` — generation counter for the style above.
+extern "C" fn native_system_chrome_generation(env: NapiEnv, _info: NapiCallbackInfo) -> NapiValue {
+    double(env, super::system_chrome_generation() as f64)
+}
+
+/// `nativeSetKeyboardHeight(height)` — ArkTS reports the on-screen IME height
+/// in logical pixels through `keyboard.getKeyboardHeight()` / the input event.
+extern "C" fn native_set_keyboard_height(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc >= 1 {
+        if let Some(height) = arg_f64(env, argv[0]) {
+            crate::set_keyboard_height(height.max(0.0) as f32);
+            if let Some(p) = try_platform() {
+                p.refresh_insets();
+            }
+        }
+    }
+    undefined(env)
+}
+
+/// `nativeSetOpenUrlCallback(fn)` — the callback returns `true` when ArkTS
+/// accepts the URL.  Its result is forwarded to GPUI's `open_url`.
+extern "C" fn native_set_open_url_callback(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let Some(reference) = store_function_ref(env, argv[0]) else {
+        return undefined(env);
+    };
+    OPEN_URL_REF.store(reference, Ordering::Release);
+    platform::set_open_url_handler(Box::new(|url| {
+        let env = NAPI_ENV.load(Ordering::Acquire);
+        let Some(text) = string_value(env, url) else {
+            return false;
+        };
+        call_function(env, OPEN_URL_REF.load(Ordering::Acquire), &[text])
+            .and_then(|v| arg_bool(env, v))
+            .unwrap_or(false)
+    }));
+    log::info!("napi: open URL callback registered");
+    undefined(env)
+}
+
+/// `nativeSetPickPathsCallback(fn)` — ArkTS picks paths and calls back through
+/// `nativePickerResult`.
+extern "C" fn native_set_pick_paths_callback(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let Some(reference) = store_function_ref(env, argv[0]) else {
+        return undefined(env);
+    };
+    PICK_PATHS_REF.store(reference, Ordering::Release);
+    platform::set_pick_paths_handler(Box::new(|directories, save, suggested_name| {
+        let env = NAPI_ENV.load(Ordering::Acquire);
+        let args: Vec<NapiValue> = [
+            Some(bool_value(env, directories)),
+            Some(bool_value(env, save)),
+            suggested_name.and_then(|name| string_value(env, name)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        call_function(env, PICK_PATHS_REF.load(Ordering::Acquire), &args);
+    }));
+    log::info!("napi: path picker callback registered");
+    undefined(env)
+}
+
+/// `nativePickerResult(ok, paths)` — ArkTS returns a path picker result.
+extern "C" fn native_picker_result(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<2>(env, info);
+    if argc < 2 {
+        return undefined(env);
+    }
+    let ok = arg_bool(env, argv[0]).unwrap_or(false);
+    let result = if ok {
+        arg_string_array(env, argv[1])
+            .map(|s| Some(s.into_iter().map(PathBuf::from).collect()))
+            .ok_or_else(|| anyhow::anyhow!("invalid picker result"))
+    } else {
+        Ok(None)
+    };
+    if let Some(p) = try_platform() {
+        p.finish_picker(result);
+    }
+    undefined(env)
+}
+
+/// `nativeSetCredentialCallback(fn)` — ArkTS implements credential storage.
+///
+/// The callback receives `(service, username, operation, password?)` where
+/// operation is `0` = read, `1` = write, `2` = delete.  Write includes the
+/// password as a UTF-8 string; read returns the password string or `null`, and
+/// write/delete return nothing.  Failures should be thrown by ArkTS.
+extern "C" fn native_set_credential_callback(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc < 1 {
+        return undefined(env);
+    }
+    let Some(reference) = store_function_ref(env, argv[0]) else {
+        return undefined(env);
+    };
+    CREDENTIAL_REF.store(reference, Ordering::Release);
+    platform::set_credential_handler(Box::new(
+        |service: &str, username: &str, op: platform::CredentialOp<'_>| {
+            let env = NAPI_ENV.load(Ordering::Acquire);
+            let Some(service_value) = string_value(env, service) else {
+                return Err(anyhow::anyhow!("failed to create credential service value"));
+            };
+            let Some(username_value) = string_value(env, username) else {
+                return Err(anyhow::anyhow!(
+                    "failed to create credential username value"
+                ));
+            };
+            let (code, password): (i32, Option<&[u8]>) = match op {
+                platform::CredentialOp::Read => (0, None),
+                platform::CredentialOp::Write(bytes) => (1, Some(bytes)),
+                platform::CredentialOp::Delete => (2, None),
+            };
+            let mut args = vec![service_value, username_value, int32(env, code)];
+            if let Some(bytes) = password {
+                let text = String::from_utf8_lossy(bytes);
+                let Some(value) = string_value(env, &text) else {
+                    return Err(anyhow::anyhow!(
+                        "failed to create credential password value"
+                    ));
+                };
+                args.push(value);
+            }
+            let result = call_function(env, CREDENTIAL_REF.load(Ordering::Acquire), &args)
+                .ok_or_else(|| anyhow::anyhow!("credential bridge callback failed"))?;
+            match op {
+                platform::CredentialOp::Read => {
+                    if result.is_null() {
+                        return Ok(None);
+                    }
+                    let mut ty: c_int = 0;
+                    if unsafe { napi_typeof(env, result, &mut ty as *mut _) } != NAPI_OK {
+                        return Err(anyhow::anyhow!("failed to inspect credential result"));
+                    }
+                    if ty == NAPI_NULL || ty == NAPI_UNDEFINED {
+                        return Ok(None);
+                    }
+                    Ok(arg_string(env, result).map(String::into_bytes))
+                }
+                platform::CredentialOp::Write(_) | platform::CredentialOp::Delete => Ok(None),
+            }
+        },
+    ));
+    log::info!("napi: credential callback registered");
+    undefined(env)
+}
+
+/// `nativeOpenUrls(urls)` — ArkTS reports a deeplink / `want` URI list.
+extern "C" fn native_open_urls(env: NapiEnv, info: NapiCallbackInfo) -> NapiValue {
+    let (argc, argv) = read_args::<1>(env, info);
+    if argc >= 1 {
+        if let Some(urls) = arg_string_array(env, argv[0]) {
+            if let Some(p) = try_platform() {
+                p.deliver_open_urls(urls.clone());
+            }
+            #[cfg(feature = "deeplink")]
+            for url in &urls {
+                crate::packages::deeplink::ohos_notify_deep_link(url);
+            }
+        }
+    }
+    undefined(env)
 }

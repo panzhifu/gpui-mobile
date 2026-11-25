@@ -166,6 +166,7 @@ pub mod display;
 pub mod keyboard;
 pub mod logging;
 pub mod napi;
+pub(crate) mod packages;
 pub mod platform;
 pub mod vsync;
 pub mod window;
@@ -256,7 +257,7 @@ pub struct TouchPoint {
 // pushed into native code via the NAPI exports in `napi.rs`.  They are stored
 // here so the platform/window code can read them synchronously.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Display density as a scale factor relative to 160 dpi, stored as `f32` bits.
 static DENSITY_BITS: AtomicU32 = AtomicU32::new(0); // 0 == "unset"
@@ -269,6 +270,11 @@ static SAFE_AREA_BITS: [AtomicU32; 4] = [
     AtomicU32::new(0),
 ];
 
+/// Appearance mode pushed from ArkTS: 0=light, 1=dark, 2=vibrant light,
+/// 3=vibrant dark.  Stored globally so a configuration change delivered before
+/// the platform singleton exists is not lost.
+static APPEARANCE_MODE: AtomicU32 = AtomicU32::new(0);
+
 /// Desired status-bar light/dark content style (`false` = dark content).
 static STATUS_BAR_LIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -277,6 +283,12 @@ static STATUS_BAR_COLOR: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Desired navigation-bar background colour (`u32::MAX` == unset).
 static NAV_BAR_COLOR: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Generation counter bumped on every `apply_system_chrome` call.  ArkTS polls
+/// the current generation and only re-applies the style when it changes, so the
+/// native side does not need to clear any values (which would break callers
+/// that read them directly).
+static SYSTEM_CHROME_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn f32_bits(a: &AtomicU32) -> f32 {
     f32::from_bits(a.load(Ordering::Relaxed))
@@ -322,6 +334,15 @@ pub fn safe_area_insets() -> (f32, f32, f32, f32) {
     )
 }
 
+pub fn set_appearance_mode(mode: u32) {
+    APPEARANCE_MODE.store(mode.min(3), Ordering::Release);
+}
+
+/// Current appearance mode pushed from ArkTS.
+pub fn appearance_mode() -> u32 {
+    APPEARANCE_MODE.load(Ordering::Acquire)
+}
+
 /// Apply system chrome (status bar / navigation bar) styling.
 ///
 /// The actual styling is performed by the ArkTS layer — native code records
@@ -340,6 +361,7 @@ pub fn apply_system_chrome(style: &crate::SystemChromeStyle) {
         style.navigation_bar_color.unwrap_or(u32::MAX),
         Ordering::Release,
     );
+    SYSTEM_CHROME_GENERATION.fetch_add(1, Ordering::AcqRel);
     log::debug!(
         "ohos::apply_system_chrome: status_light={} status_color={:?} nav_color={:?}",
         style.status_bar_style == crate::StatusBarContentStyle::Light,
@@ -367,6 +389,15 @@ pub fn navigation_bar_color() -> Option<u32> {
         u32::MAX => None,
         v => Some(v),
     }
+}
+
+/// Current system-chrome generation.
+///
+/// ArkTS polls this through `nativeTakeSystemChrome`; a value different from
+/// the last applied one means the status/navigation bar style must be applied
+/// again.  Starts at `0` and increments on every `apply_system_chrome`.
+pub fn system_chrome_generation() -> u64 {
+    SYSTEM_CHROME_GENERATION.load(Ordering::Acquire)
 }
 
 /// Show the software keyboard.

@@ -21,7 +21,11 @@ pub fn set_text(text: &str) -> Result<(), String> {
     {
         android::set_text(text)
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[cfg(target_env = "ohos")]
+    {
+        crate::ohos::packages::clipboard::set_text(text)
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
     {
         let _ = text;
         Err("clipboard is only available on iOS and Android".into())
@@ -38,7 +42,11 @@ pub fn get_text() -> Result<Option<String>, String> {
     {
         android::get_text()
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[cfg(target_env = "ohos")]
+    {
+        crate::ohos::packages::clipboard::get_text()
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
     {
         Err("clipboard is only available on iOS and Android".into())
     }
@@ -54,7 +62,11 @@ pub fn has_text() -> Result<bool, String> {
     {
         android::has_text()
     }
-    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    #[cfg(target_env = "ohos")]
+    {
+        crate::ohos::packages::clipboard::has_text()
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android", target_env = "ohos")))]
     {
         Err("clipboard is only available on iOS and Android".into())
     }

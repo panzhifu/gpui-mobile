@@ -194,8 +194,12 @@ The `ohos` backend mirrors the Android one. Key points:
 > system libraries must be linked explicitly — that now lives in the `#[link]`
 > attributes in `src/ohos/mod.rs`, not in each downstream's build script.
 >
-> The software keyboard is best-effort (driven from ArkTS via
-> `@ohos.inputMethod`); hardware key events already work.
+> The software keyboard is driven from ArkTS (`@ohos.inputMethod`) through a
+> hidden `TextInput` that forwards committed text and editing keys to GPUI.
+> The example also reports keyboard height and bridges system-bar styling,
+> plain-text clipboard, URL launching, deeplinks, path picking and credential
+> storage. Pasteboard reads still require the app to arrange paste access /
+> `READ_PASTEBOARD`. These bridges still need physical-device validation.
 
 ## Rendering views to images
 

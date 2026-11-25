@@ -37,7 +37,7 @@ use futures::channel::oneshot;
 use gpui::{
     self, AtlasKey, AtlasTile, Capslock, DispatchEventResult, GpuSpecs, Modifiers, PlatformAtlas,
     PlatformDisplay, PlatformInputHandler, PlatformWindow, PromptButton, PromptLevel,
-    RequestFrameOptions, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    RequestFrameOptions, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets,
     WindowVisibility,
 };
 use gpui_wgpu::{wgpu, GpuContext, WgpuRenderer, WgpuSurfaceConfig};
@@ -168,6 +168,7 @@ pub type ResizeCallback = Box<dyn FnMut(Size<super::DevicePixels>, f32) + Send +
 pub type CloseCallback = Box<dyn FnOnce() + Send + 'static>;
 /// Called when the window appearance (light/dark) changes.
 pub type AppearanceCallback = Box<dyn FnMut(WindowAppearance) + Send + 'static>;
+pub type InsetsCallback = Box<dyn FnMut(WindowInsets) + Send + 'static>;
 
 // ── appearance ────────────────────────────────────────────────────────────────
 
@@ -223,6 +224,9 @@ struct WindowState {
 
     /// Safe area insets in physical (device) pixels.
     safe_area_insets: SafeAreaInsets,
+
+    insets: WindowInsets,
+    insets_callback: Option<InsetsCallback>,
 
     appearance: WindowAppearance,
     is_active: bool,
@@ -299,6 +303,8 @@ impl OhosWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            insets: WindowInsets::default(),
+            insets_callback: None,
             appearance: WindowAppearance::Light,
             is_active: true,
             transparent,
@@ -328,6 +334,8 @@ impl OhosWindow {
             height,
             scale_factor,
             safe_area_insets: SafeAreaInsets::default(),
+            insets: WindowInsets::default(),
+            insets_callback: None,
             appearance: WindowAppearance::Light,
             is_active: false,
             transparent: false,
@@ -425,6 +433,14 @@ impl OhosWindow {
         state.is_active = false;
         self.active
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Fire the GPUI close callback when the host is actually destroying the
+    /// application.  Surface loss alone usually means "backgrounded" on OHOS.
+    pub fn notify_close(&self) {
+        if let Some(callback) = self.state.lock().close_callback.take() {
+            callback();
+        }
     }
 
     /// Called when `OnSurfaceChanged` reports new dimensions.
@@ -646,6 +662,60 @@ impl OhosWindow {
     /// Display scale factor (device pixels per logical pixel).
     pub fn scale_factor(&self) -> f32 {
         self.state.lock().scale_factor
+    }
+
+    /// Refresh the logical-to-physical scale after ArkTS reports a density or
+    /// font-scale change.  The physical surface size is unchanged; GPUI still
+    /// needs a resize notification so it recomputes logical bounds.
+    pub fn set_scale_factor(&self, scale_factor: f32) {
+        let (width, height, callback) = {
+            let mut state = self.state.lock();
+            if (state.scale_factor - scale_factor).abs() < 0.001 {
+                return;
+            }
+            state.scale_factor = scale_factor;
+            (state.width, state.height, state.resize_callback.take())
+        };
+        if let Some(mut cb) = callback {
+            cb(
+                Size {
+                    width: super::DevicePixels(width),
+                    height: super::DevicePixels(height),
+                },
+                scale_factor,
+            );
+            if self.state.lock().resize_callback.is_none() {
+                self.state.lock().resize_callback = Some(cb);
+            }
+        }
+    }
+
+    pub fn insets(&self) -> WindowInsets {
+        self.state.lock().insets.clone()
+    }
+
+    pub fn set_insets(&self, insets: WindowInsets) {
+        let callback = {
+            let mut state = self.state.lock();
+            if state.insets == insets {
+                return;
+            }
+            state.insets = insets.clone();
+            state.insets_callback.take()
+        };
+        if let Some(mut cb) = callback {
+            cb(insets.clone());
+            if self.state.lock().insets_callback.is_none() {
+                self.state.lock().insets_callback = Some(cb);
+            }
+        }
+    }
+
+    pub fn on_insets_changed<F>(&self, cb: F)
+    where
+        F: FnMut(WindowInsets) + Send + 'static,
+    {
+        self.state.lock().insets_callback = Some(Box::new(cb));
     }
 
     /// Returns the current safe area insets in physical (device) pixels.
@@ -1386,6 +1456,16 @@ impl PlatformWindow for OhosPlatformWindow {
         let send_callback: Box<dyn FnOnce() + Send + 'static> =
             unsafe { std::mem::transmute::<Box<dyn FnOnce()>, Box<dyn FnOnce() + Send>>(callback) };
         self.window.on_close(send_callback);
+    }
+
+    fn insets(&self) -> WindowInsets {
+        self.window.insets()
+    }
+
+    fn on_insets_changed(&self, callback: Box<dyn FnMut(WindowInsets)>) {
+        let send_callback: Box<dyn FnMut(WindowInsets) + Send> =
+            unsafe { std::mem::transmute(callback) };
+        self.window.on_insets_changed(send_callback);
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {

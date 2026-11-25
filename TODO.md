@@ -1,8 +1,10 @@
-- HarmonyOS / OpenHarmony: implement the `packages/*` bridges (they are stubs on
-  `target_env = "ohos"` — each needs a NAPI/ArkTS implementation). The core
-  platform layer (rendering, touch input, lifecycle) is implemented.
-- HarmonyOS: validate the backend on a physical device / emulator, and wire the
-  software keyboard through `@ohos.inputMethod` (currently best-effort).
+- HarmonyOS / OpenHarmony: implement the remaining `packages/*` bridges. The
+  core platform layer (rendering, touch input, lifecycle) is implemented. The
+  software keyboard, system-bar styling, plain-text clipboard, URL launching,
+  deeplinks, path picking and credential storage are bridged through the
+  example's ArkTS NAPI exports; other package bridges remain.
+- HarmonyOS: validate the backend on a physical device / emulator, including
+  IME composition, hardware keys, system pasteboard and path picking.
 - Improve the UX of the APIs exposed by the library.
 - Assitive technologies support (e.g., screen readers, voice control).
 - Deeplinking?

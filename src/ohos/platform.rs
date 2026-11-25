@@ -30,10 +30,11 @@
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
-    Action, ActivityGuard, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
-    ForegroundExecutor, KeybindingKeystroke, Keymap, Keystroke, Menu, MenuItem, PathPromptOptions,
-    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Task, ThermalState, WindowAppearance, WindowParams,
+    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem,
+    CursorStyle, Edges, ForegroundExecutor, KeybindingKeystroke, Keymap, Keystroke, Menu, MenuItem,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, Task, ThermalState, WindowAppearance, WindowInsets,
+    WindowParams,
 };
 use gpui_wgpu::CosmicTextSystem;
 use parking_lot::Mutex;
@@ -51,7 +52,7 @@ use std::{
 use super::{
     dispatcher::OhosDispatcher,
     display::{DisplayList, OhosDisplay},
-    window::{OhosNativeWindow, OhosWindow, WindowList},
+    window::{OhosNativeWindow, OhosWindow, WindowAppearance as OhosWindowAppearance, WindowList},
     OhosBackend,
 };
 use gpui_wgpu::GpuContext;
@@ -124,6 +125,106 @@ type KeyboardHandler = Box<dyn Fn(Option<crate::KeyboardType>) + Send + Sync + '
 
 static KEYBOARD_HANDLER: Mutex<Option<KeyboardHandler>> = Mutex::new(None);
 
+/// Handler installed by `napi.rs` that writes text to the ArkTS pasteboard.
+type ClipboardWriteHandler = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
+static CLIPBOARD_WRITE_HANDLER: Mutex<Option<ClipboardWriteHandler>> = Mutex::new(None);
+
+/// Handler installed by `napi.rs` that asks ArkTS to open a URL.
+type OpenUrlHandler = Box<dyn Fn(&str) -> bool + Send + Sync + 'static>;
+
+static OPEN_URL_HANDLER: Mutex<Option<OpenUrlHandler>> = Mutex::new(None);
+
+/// Handler installed by `napi.rs` that asks ArkTS to open the native file
+/// picker.  The three arguments are `(directories, save, suggested_name)`.
+type PickPathsHandler = Box<dyn Fn(bool, bool, Option<&str>) + Send + Sync + 'static>;
+
+static PICK_PATHS_HANDLER: Mutex<Option<PickPathsHandler>> = Mutex::new(None);
+
+/// A credential-store operation forwarded to ArkTS.
+#[derive(Clone, Copy, Debug)]
+pub enum CredentialOp<'a> {
+    Read,
+    Write(&'a [u8]),
+    Delete,
+}
+
+/// Handler for platform credential storage through ArkTS preferences/HUKS.
+type CredentialHandler = Box<
+    dyn for<'a> Fn(&str, &str, CredentialOp<'a>) -> Result<Option<Vec<u8>>> + Send + Sync + 'static,
+>;
+
+static CREDENTIAL_HANDLER: Mutex<Option<CredentialHandler>> = Mutex::new(None);
+
+/// Result channel for a native path picker request.  GPUI's "existing paths"
+/// prompt accepts multiple results, while "new path" returns exactly one.
+enum PendingPicker {
+    Paths(oneshot::Sender<Result<Option<Vec<PathBuf>>>>),
+    NewPath(oneshot::Sender<Result<Option<PathBuf>>>),
+}
+
+/// Install the ArkTS clipboard write bridge (called from `napi.rs`).
+pub fn set_clipboard_write_handler(handler: ClipboardWriteHandler) {
+    *CLIPBOARD_WRITE_HANDLER.lock() = Some(handler);
+}
+
+fn request_clipboard_write(text: &str) {
+    if let Some(handler) = CLIPBOARD_WRITE_HANDLER.lock().as_ref() {
+        handler(text);
+    } else {
+        log::debug!("clipboard write: no ArkTS handler installed yet");
+    }
+}
+
+/// Install the ArkTS URL-launch bridge (called from `napi.rs`).
+pub fn set_open_url_handler(handler: OpenUrlHandler) {
+    *OPEN_URL_HANDLER.lock() = Some(handler);
+}
+
+/// Ask ArkTS to open `url`; `false` means no handler is installed yet.
+pub fn request_open_url(url: &str) -> bool {
+    if let Some(handler) = OPEN_URL_HANDLER.lock().as_ref() {
+        handler(url)
+    } else {
+        log::debug!("open_url: no ArkTS handler installed yet");
+        false
+    }
+}
+
+/// Install the ArkTS file-picker bridge (called from `napi.rs`).
+pub fn set_pick_paths_handler(handler: PickPathsHandler) {
+    *PICK_PATHS_HANDLER.lock() = Some(handler);
+}
+
+/// Ask ArkTS to show a file picker.  Results are returned through
+/// `napi::native_picker_result`.
+pub fn request_pick_paths(directories: bool, save: bool, suggested_name: Option<&str>) -> bool {
+    if let Some(handler) = PICK_PATHS_HANDLER.lock().as_ref() {
+        handler(directories, save, suggested_name);
+        true
+    } else {
+        log::debug!("pick_paths: no ArkTS handler installed yet");
+        false
+    }
+}
+
+/// Install the ArkTS credential-store bridge (called from `napi.rs`).
+pub fn set_credential_handler(handler: CredentialHandler) {
+    *CREDENTIAL_HANDLER.lock() = Some(handler);
+}
+
+fn has_credential_handler() -> bool {
+    CREDENTIAL_HANDLER.lock().is_some()
+}
+
+fn credential_op(service: &str, username: &str, op: CredentialOp<'_>) -> Result<Option<Vec<u8>>> {
+    if let Some(handler) = CREDENTIAL_HANDLER.lock().as_ref() {
+        handler(service, username, op)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Install the ArkTS keyboard bridge (called from `napi.rs`).
 pub fn set_keyboard_handler(handler: KeyboardHandler) {
     *KEYBOARD_HANDLER.lock() = Some(handler);
@@ -142,6 +243,24 @@ pub fn request_show_keyboard(keyboard_type: crate::KeyboardType) {
 pub fn request_hide_keyboard() {
     if let Some(handler) = KEYBOARD_HANDLER.lock().as_ref() {
         handler(None);
+    }
+}
+
+fn appearance_from_mode(mode: u32) -> WindowAppearance {
+    match mode {
+        1 => WindowAppearance::Dark,
+        2 => WindowAppearance::VibrantLight,
+        3 => WindowAppearance::VibrantDark,
+        _ => WindowAppearance::Light,
+    }
+}
+
+fn appearance_to_window(appearance: WindowAppearance) -> OhosWindowAppearance {
+    match appearance {
+        WindowAppearance::Light => OhosWindowAppearance::Light,
+        WindowAppearance::Dark => OhosWindowAppearance::Dark,
+        WindowAppearance::VibrantLight => OhosWindowAppearance::HighContrastLight,
+        WindowAppearance::VibrantDark => OhosWindowAppearance::HighContrastDark,
     }
 }
 
@@ -165,6 +284,13 @@ struct OhosPlatformState {
     reopen_callback: Option<Box<dyn FnMut() + Send>>,
     open_urls_callback: Option<Box<dyn FnMut(Vec<String>) + Send>>,
     keyboard_layout_callback: Option<Box<dyn FnMut() + Send>>,
+    lifecycle_callback: Option<Box<dyn FnMut(AppLifecyclePhase) + Send>>,
+    memory_warning_callback: Option<Box<dyn FnMut() + Send>>,
+    appearance: WindowAppearance,
+    insets: Option<WindowInsets>,
+
+    /// Pending native file-picker request, completed by `napi::native_picker_result`.
+    pending_picker: Option<PendingPicker>,
 
     is_active: bool,
     headless: bool,
@@ -274,6 +400,11 @@ impl OhosPlatform {
                 reopen_callback: None,
                 open_urls_callback: None,
                 keyboard_layout_callback: None,
+                lifecycle_callback: None,
+                memory_warning_callback: None,
+                appearance: appearance_from_mode(super::appearance_mode()),
+                insets: None,
+                pending_picker: None,
                 is_active: false,
                 headless,
                 preferred_backend: OhosBackend::Gles,
@@ -426,6 +557,8 @@ impl OhosPlatform {
             scale_factor,
             transparent,
         )?;
+        let appearance = appearance_to_window(state.appearance);
+        window.set_appearance(appearance);
         state.windows.push(Arc::clone(&window));
         log::info!(
             "OhosPlatform::open_native_window — id={:#x} {}×{} scale={:.1}",
@@ -478,7 +611,106 @@ impl OhosPlatform {
     // ── clipboard / credentials ───────────────────────────────────────────────
 
     pub fn write_to_clipboard_impl(&self, text: String) {
+        // Keep the local cache so reads on the same frame see the write, and
+        // mirror it to the real OHOS pasteboard through ArkTS.
+        self.state.lock().clipboard.write(text.clone());
+        request_clipboard_write(&text);
+    }
+
+    /// Called from `napi.rs` when ArkTS reports the current pasteboard content.
+    pub fn clipboard_changed(&self, text: String) {
         self.state.lock().clipboard.write(text);
+    }
+
+    /// Complete the pending picker request from the ArkTS bridge.  A "new
+    /// path" request only consumes the first returned path.
+    pub fn finish_picker(&self, paths: Result<Option<Vec<PathBuf>>>) {
+        match self.state.lock().pending_picker.take() {
+            Some(PendingPicker::Paths(tx)) => {
+                let _ = tx.send(paths);
+            }
+            Some(PendingPicker::NewPath(tx)) => {
+                let first = paths.map(|paths| {
+                    paths.and_then(|mut p| {
+                        if p.is_empty() {
+                            None
+                        } else {
+                            Some(p.remove(0))
+                        }
+                    })
+                });
+                let _ = tx.send(first);
+            }
+            None => {}
+        }
+    }
+
+    /// Apply a density change to the primary window.
+    pub fn apply_density(&self, scale_factor: f32) {
+        if let Some(win) = self.primary_window() {
+            win.set_scale_factor(scale_factor);
+        }
+    }
+
+    /// Refresh logical window insets from the values ArkTS publishes.
+    pub fn refresh_insets(&self) {
+        let (top, bottom, left, right) = super::safe_area_insets();
+        let ime_bottom = crate::keyboard_height();
+        let insets = WindowInsets {
+            safe_area: Edges {
+                top: gpui::px(top),
+                right: gpui::px(right),
+                bottom: gpui::px(bottom),
+                left: gpui::px(left),
+            },
+            ime: Edges {
+                top: gpui::px(0.0),
+                right: gpui::px(0.0),
+                bottom: gpui::px(ime_bottom),
+                left: gpui::px(0.0),
+            },
+        };
+        {
+            let mut state = self.state.lock();
+            if state.insets.as_ref() == Some(&insets) {
+                return;
+            }
+            state.insets = Some(insets.clone());
+        }
+        if let Some(win) = self.primary_window() {
+            win.set_insets(insets);
+        }
+    }
+
+    /// Report an application lifecycle phase change from ArkTS.
+    pub fn deliver_lifecycle(&self, phase: AppLifecyclePhase) {
+        let mut callback = self.state.lock().lifecycle_callback.take();
+        if let Some(cb) = callback.as_mut() {
+            cb(phase);
+        }
+        if let Some(cb) = callback {
+            self.state.lock().lifecycle_callback.get_or_insert(cb);
+        }
+    }
+
+    /// Report system memory pressure from ArkTS.
+    pub fn deliver_memory_warning(&self) {
+        let mut callback = self.state.lock().memory_warning_callback.take();
+        if let Some(cb) = callback.as_mut() {
+            cb();
+        }
+        if let Some(cb) = callback {
+            self.state.lock().memory_warning_callback.get_or_insert(cb);
+        }
+    }
+
+    /// Update the platform/window appearance from ArkTS colour-mode changes.
+    pub fn set_appearance(&self, appearance: WindowAppearance) {
+        self.state.lock().appearance = appearance;
+        let window_appearance = appearance_to_window(appearance);
+        if let Some(win) = self.primary_window() {
+            win.set_appearance(window_appearance);
+        }
     }
 
     pub fn read_from_clipboard_impl(&self) -> Option<String> {
@@ -491,6 +723,10 @@ impl OhosPlatform {
         username: &str,
         password: &[u8],
     ) -> Result<()> {
+        if has_credential_handler() {
+            credential_op(service, username, CredentialOp::Write(password))?;
+            return Ok(());
+        }
         self.state
             .lock()
             .credentials
@@ -498,10 +734,17 @@ impl OhosPlatform {
     }
 
     pub fn read_credentials_impl(&self, service: &str, username: &str) -> Result<Option<Vec<u8>>> {
+        if has_credential_handler() {
+            return credential_op(service, username, CredentialOp::Read);
+        }
         self.state.lock().credentials.read(service, username)
     }
 
     pub fn delete_credentials_impl(&self, service: &str, username: &str) -> Result<()> {
+        if has_credential_handler() {
+            credential_op(service, username, CredentialOp::Delete)?;
+            return Ok(());
+        }
         self.state.lock().credentials.delete(service, username)
     }
 
@@ -672,11 +915,13 @@ impl Platform for OhosPlatform {
     }
 
     fn window_appearance(&self) -> WindowAppearance {
-        WindowAppearance::Dark
+        self.state.lock().appearance
     }
 
     fn open_url(&self, url: &str) {
-        log::info!("OhosPlatform::open_url({url}) — ArkTS launch not yet wired");
+        if !request_open_url(url) {
+            log::warn!("OhosPlatform::open_url({url}) — ArkTS launch bridge unavailable");
+        }
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
@@ -693,20 +938,35 @@ impl Platform for OhosPlatform {
 
     fn prompt_for_paths(
         &self,
-        _options: PathPromptOptions,
+        options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>> {
         let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Ok(None));
+        let suggested = options.prompt.as_ref().map(|s| s.as_ref());
+        if !request_pick_paths(options.directories, false, suggested) {
+            let _ = tx.send(Ok(None));
+            return rx;
+        }
+        self.state.lock().pending_picker = Some(PendingPicker::Paths(tx));
         rx
     }
 
     fn prompt_for_new_path(
         &self,
-        _directory: &Path,
-        _suggested_name: Option<&str>,
+        directory: &Path,
+        suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<PathBuf>>> {
         let (tx, rx) = oneshot::channel();
-        let _ = tx.send(Ok(None));
+        let suggested = suggested_name.map(ToOwned::to_owned).unwrap_or_else(|| {
+            directory
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        if !request_pick_paths(false, true, Some(&suggested)) {
+            let _ = tx.send(Ok(None));
+            return rx;
+        }
+        self.state.lock().pending_picker = Some(PendingPicker::NewPath(tx));
         rx
     }
 
@@ -764,6 +1024,21 @@ impl Platform for OhosPlatform {
         });
     }
 
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
+        self.state.lock().lifecycle_callback = Some(unsafe {
+            std::mem::transmute::<
+                Box<dyn FnMut(AppLifecyclePhase)>,
+                Box<dyn FnMut(AppLifecyclePhase) + Send>,
+            >(callback)
+        });
+    }
+
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        self.state.lock().memory_warning_callback = Some(unsafe {
+            std::mem::transmute::<Box<dyn FnMut()>, Box<dyn FnMut() + Send>>(callback)
+        });
+    }
+
     fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {}
 
     fn set_dock_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {}
@@ -804,10 +1079,7 @@ impl Platform for OhosPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        self.state
-            .lock()
-            .clipboard
-            .write(item.text().unwrap_or_default());
+        self.write_to_clipboard_impl(item.text().unwrap_or_default());
     }
 
     // The OHOS triple reports `target_os = "linux"`, so the trait additionally
@@ -822,23 +1094,18 @@ impl Platform for OhosPlatform {
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
-        let result = self.state.lock().credentials.write(url, username, password);
-        Task::ready(result)
+        Task::ready(self.write_credentials_impl(url, username, password))
     }
 
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
         let result = self
-            .state
-            .lock()
-            .credentials
-            .read(url, "default")
+            .read_credentials_impl(url, "default")
             .map(|opt| opt.map(|pw| ("default".to_string(), pw)));
         Task::ready(result)
     }
 
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
-        let result = self.state.lock().credentials.delete(url, "default");
-        Task::ready(result)
+        Task::ready(self.delete_credentials_impl(url, "default"))
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
@@ -997,6 +1264,12 @@ impl Platform for SharedPlatform {
     }
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         <OhosPlatform as Platform>::on_reopen(&self.0, callback)
+    }
+    fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
+        <OhosPlatform as Platform>::on_app_lifecycle(&self.0, callback)
+    }
+    fn on_memory_warning(&self, callback: Box<dyn FnMut()>) {
+        <OhosPlatform as Platform>::on_memory_warning(&self.0, callback)
     }
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap) {
         <OhosPlatform as Platform>::set_menus(&self.0, menus, keymap)
