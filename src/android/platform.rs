@@ -391,15 +391,30 @@ impl AndroidPlatform {
                 "/system/fonts/NotoSerif-Bold.ttf",
             ];
             let mut font_data: Vec<std::borrow::Cow<'static, [u8]>> = Vec::new();
-            for path in font_paths {
-                match std::fs::read(path) {
-                    Ok(bytes) => {
-                        log::info!("loaded system font: {path} ({} bytes)", bytes.len());
-                        font_data.push(std::borrow::Cow::Owned(bytes));
+
+            // ── Core fonts: path-backed registration ────────────────────
+            //
+            // `add_font_files` keeps only face metadata in fontdb and maps the
+            // bytes in lazily on first use (`Source::File` → shared mmap in
+            // `get_font`), so startup no longer pins these files in RAM. Paths
+            // already registered (an earlier scan, reader-installed fonts) are
+            // skipped by the path guard and still report their families.
+            {
+                let existing: Vec<std::path::PathBuf> = font_paths
+                    .iter()
+                    .filter(|path| std::path::Path::new(path.as_str()).is_file())
+                    .map(|path| std::path::PathBuf::from(path.as_str()))
+                    .collect();
+                match text_system.add_font_files(existing) {
+                    Ok(per_path) => {
+                        let with_faces = per_path.iter().filter(|f| !f.is_empty()).count();
+                        log::info!(
+                            "registered {} system font paths ({} with faces)",
+                            per_path.len(),
+                            with_faces
+                        );
                     }
-                    Err(e) => {
-                        log::debug!("skipping system font {path}: {e}");
-                    }
+                    Err(e) => log::warn!("failed to register system font files: {e:#}"),
                 }
             }
 
@@ -466,10 +481,8 @@ impl AndroidPlatform {
 
             if !font_data.is_empty() {
                 if let Err(e) = text_system.add_fonts(font_data) {
-                    log::warn!("failed to add system fonts: {e:#}");
+                    log::warn!("failed to add emoji font: {e:#}");
                 }
-            } else {
-                log::warn!("no system fonts found in /system/fonts/");
             }
         }
 
