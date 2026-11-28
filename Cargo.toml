@@ -201,6 +201,6 @@ debug     = true
 # 编译全过、只有真链才撞，`cargo check` 一路绿灯。判据在那棵树里收紧成
 # `all(target_os = "linux", not(target_env = "ohos"))`。
 [patch.crates-io]
-gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "ab4c54cfb63cf53bf6a805b0e1ee37b1de974bb4" }
-gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "ab4c54cfb63cf53bf6a805b0e1ee37b1de974bb4" }
-gpui-pre-platform = { git = "https://github.com/panzhifu/gpui-folio", rev = "ab4c54cfb63cf53bf6a805b0e1ee37b1de974bb4" }
+gpui-pre = { git = "https://github.com/panzhifu/gpui-folio", rev = "b8dc78a02139b13a59dad91503deab2f5759d145" }
+gpui-pre-wgpu = { git = "https://github.com/panzhifu/gpui-folio", rev = "b8dc78a02139b13a59dad91503deab2f5759d145" }
+gpui-pre-platform = { git = "https://github.com/panzhifu/gpui-folio", rev = "b8dc78a02139b13a59dad91503deab2f5759d145" }
