@@ -402,8 +402,8 @@ impl AndroidPlatform {
             {
                 let existing: Vec<std::path::PathBuf> = font_paths
                     .iter()
-                    .filter(|path| std::path::Path::new(path.as_str()).is_file())
-                    .map(|path| std::path::PathBuf::from(path.as_str()))
+                    .filter(|path| std::path::Path::new(*path).is_file())
+                    .map(|path| std::path::PathBuf::from(*path))
                     .collect();
                 match text_system.add_font_files(existing) {
                     Ok(per_path) => {
